@@ -213,7 +213,7 @@ def create_skull_masks_procedural_TAC(
     shape_corr_len_vox=34.0,
     flatten_strength=0.0e-3,
     base_cut_strength=0.0e-3,
-    p_xy=2.2,                  # 👈 clave: aplanado lateral suave SOLO XY
+    p_xy=2.2,
     center_shift_mm=0.8,
     rng=None,
 ):
