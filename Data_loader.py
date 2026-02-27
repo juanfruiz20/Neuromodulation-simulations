@@ -179,7 +179,7 @@ class TusDataset(Dataset):
 # 5) Sanity check rápido
 # ---------------------------
 if __name__ == "__main__":
-    DATA_DIR = r"dataset_TUS_dx05_TAClike_ovoidXY_R30_thick2dx"
+    DATA_DIR = r"C:\Users\USUARIO\Desktop\UIC Bioingenieria\TFG\dataset_TUS_1000"
 
     files = list_npz_files(DATA_DIR)
     train_files, val_files, test_files = split_files(
