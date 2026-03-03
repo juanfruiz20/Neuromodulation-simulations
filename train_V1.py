@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import time
 import random
 import numpy as np
@@ -12,6 +11,12 @@ from torch.utils.data import DataLoader
 
 from Data_loader import list_npz_files, split_files, compute_stats, TusDataset
 from Model_Unet3D import ResUNet3D_HQ
+
+# --- AMP GradScaler compatible (PyTorch nuevo/viejo) ---
+try:
+    from torch.amp import GradScaler  # PyTorch nuevo
+except Exception:
+    from torch.cuda.amp import GradScaler  # PyTorch viejo
 
 
 # ----------------------------
@@ -30,7 +35,7 @@ def seed_all(seed: int = 123):
 def grad3d(x: torch.Tensor):
     """
     x: [B, 1, D, H, W]
-    retorna grad magnitudes aproximadas (dx, dy, dz) con diferencias finitas.
+    retorna (dx, dy, dz) con diferencias finitas.
     """
     dx = x[:, :, 1:, :, :] - x[:, :, :-1, :, :]
     dy = x[:, :, :, 1:, :] - x[:, :, :, :-1, :]
@@ -46,26 +51,23 @@ def grad3d(x: torch.Tensor):
 class BeamPreservingLoss(nn.Module):
     """
     Loss base: L1
-    Extra opcional: L1 sobre gradientes (preserva bordes/transiciones del haz)
-    Extra opcional: peso en voxels con señal (target > thr)
+    Opcional: grad-loss para preservar bordes del haz
+    Opcional: peso extra donde hay señal (target > thr)
     """
 
     def __init__(self, use_grad=True, lambda_grad=0.05, use_signal_weight=True, thr=0.05, w_signal=3.0):
         super().__init__()
-        self.use_grad = use_grad
+        self.use_grad = bool(use_grad)
         self.lambda_grad = float(lambda_grad)
-        self.use_signal_weight = use_signal_weight
+        self.use_signal_weight = bool(use_signal_weight)
         self.thr = float(thr)
         self.w_signal = float(w_signal)
-
         self.l1 = nn.L1Loss(reduction="none")
 
     def forward(self, pred, target):
-        # pred/target: [B,1,128,128,128]
         base = self.l1(pred, target)
 
         if self.use_signal_weight:
-            # Más peso donde hay campo acústico relevante
             w = 1.0 + self.w_signal * (target > self.thr).float()
             base = base * w
 
@@ -93,17 +95,16 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
                     accum_steps=1, grad_clip=1.0, use_amp=True):
     model.train()
     total = 0.0
-
     optimizer.zero_grad(set_to_none=True)
 
     for step, (X, y) in enumerate(loader, start=1):
         X = X.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
+        # autocast: en CPU no aplica; en CUDA sí
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(use_amp and device == "cuda")):
             pred = model(X)
-            loss = criterion(pred, y)
-            loss = loss / accum_steps
+            loss = criterion(pred, y) / accum_steps
 
         if device == "cuda" and use_amp:
             scaler.scale(loss).backward()
@@ -115,7 +116,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
                 if device == "cuda" and use_amp:
                     scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=grad_clip)
+                    model.parameters(), max_norm=float(grad_clip))
 
             if device == "cuda" and use_amp:
                 scaler.step(optimizer)
@@ -125,8 +126,8 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
 
             optimizer.zero_grad(set_to_none=True)
 
-        # deshacemos el /accum_steps para reportar
-        total += float(loss.item()) * accum_steps
+        total += float(loss.item()) * accum_steps  # deshacemos el /accum_steps
+
     return total / max(1, len(loader))
 
 
@@ -151,8 +152,8 @@ def save_ckpt(path, model, optimizer, scaler, epoch, best_val, stats, config):
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
-        "epoch": epoch,
-        "best_val": best_val,
+        "epoch": int(epoch),
+        "best_val": float(best_val),
         "stats": stats,
         "config": config,
     }
@@ -163,9 +164,9 @@ def load_ckpt(path, model, optimizer=None, scaler=None, device="cpu"):
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
 
-    if optimizer is not None and "optimizer" in ckpt and ckpt["optimizer"] is not None:
+    if optimizer is not None and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and "scaler" in ckpt and ckpt["scaler"] is not None:
+    if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
 
     epoch = int(ckpt.get("epoch", 0))
@@ -181,13 +182,16 @@ def load_ckpt(path, model, optimizer=None, scaler=None, device="cpu"):
 def main():
     # ===== CONFIG =====
     SEED = 123
-    DATA_DIR = r"dataset_TUS_dx05_TAClike_ovoidXY_R30_thick2dx"
+
+    # ⚠️ Pon tu ruta absoluta aquí si estás en Oslo
+    DATA_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_1000"
+    # DATA_DIR = r"dataset_TUS_dx05_TAClike_ovoidXY_R30_thick2dx"
+
     SAVE_DIR = "checkpoints_unet_hq"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    # Con 8GB: prueba BATCH=1 y accum=2 (equivale a batch efectivo 2).
     BATCH_SIZE = 1
-    ACCUM_STEPS = 2          # 1 si usas batch=2 real; 2/4 si batch=1
+    ACCUM_STEPS = 2
     NUM_WORKERS = 2
     PIN_MEMORY = True
 
@@ -195,29 +199,23 @@ def main():
     LR = 1e-4
     WEIGHT_DECAY = 1e-4
 
-    # Modelo
-    # si te cabe y quieres más calidad: prueba 24 (pero puede OOM)
     BASE = 16
     USE_SE = True
-    OUT_POSITIVE = True      # p_max_norm >= 0
+    OUT_POSITIVE = True
 
-    # Loss (L1 sin log) + extra para bordes del haz (opcional)
     USE_GRAD_LOSS = True
-    LAMBDA_GRAD = 0.05       # pequeño: 0.02–0.10 típico
+    LAMBDA_GRAD = 0.05
     USE_SIGNAL_WEIGHT = True
     SIGNAL_THR = 0.05
     W_SIGNAL = 3.0
 
-    # Scheduler simple: ReduceLROnPlateau (robusto)
     USE_SCHEDULER = True
     PLATEAU_PATIENCE = 6
     PLATEAU_FACTOR = 0.5
 
-    # Checkpoints
     RESUME = True
-    RESUME_PATH = os.path.join(SAVE_DIR, "last.pth")  # reanuda si existe
+    RESUME_PATH = os.path.join(SAVE_DIR, "last.pth")
 
-    # Split
     TRAIN_RATIO = 0.85
     VAL_RATIO = 0.10
 
@@ -228,7 +226,6 @@ def main():
 
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
-        # opcional: TF32 (si tu GPU lo soporta). No rompe y puede acelerar.
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:
@@ -241,7 +238,6 @@ def main():
     print(
         f"Total sims: {len(files)} | train {len(train_files)} | val {len(val_files)} | test {len(test_files)}")
 
-    # Stats SOLO train
     stats = compute_stats(train_files, max_samples=128, seed=0)
 
     train_ds = TusDataset(train_files, stats=stats, normalize=True)
@@ -269,7 +265,12 @@ def main():
 
     optimizer = optim.AdamW(model.parameters(), lr=LR,
                             weight_decay=WEIGHT_DECAY)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+
+    # --- GradScaler compatible ---
+    try:
+        scaler = GradScaler("cuda", enabled=(device == "cuda"))  # nuevo
+    except TypeError:
+        scaler = GradScaler(enabled=(device == "cuda"))          # viejo
 
     criterion = BeamPreservingLoss(
         use_grad=USE_GRAD_LOSS,
@@ -279,11 +280,17 @@ def main():
         w_signal=W_SIGNAL
     )
 
+    # ===== Scheduler compatible (sin verbose si no existe) =====
     scheduler = None
     if USE_SCHEDULER:
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=PLATEAU_FACTOR, patience=PLATEAU_PATIENCE, verbose=True
-        )
+        try:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=PLATEAU_FACTOR, patience=PLATEAU_PATIENCE, verbose=True
+            )
+        except TypeError:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=PLATEAU_FACTOR, patience=PLATEAU_PATIENCE
+            )
 
     # ===== RESUME =====
     start_epoch = 0
@@ -314,37 +321,37 @@ def main():
         start_epoch, best_val, stats_ckpt, _ = load_ckpt(
             RESUME_PATH, model, optimizer, scaler, device=device)
         if stats_ckpt is not None:
-            stats = stats_ckpt  # por si reanudas exactamente mismo normalizado
+            stats = stats_ckpt
         print(f"   start_epoch={start_epoch} | best_val={best_val:.6f}")
 
-    # Guardar config para trazabilidad
     with open(os.path.join(SAVE_DIR, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
     # ===== TRAIN =====
     for epoch in range(start_epoch + 1, EPOCHS + 1):
         t0 = time.time()
+
         tr = train_one_epoch(
             model, train_loader, optimizer, scaler, criterion, device,
             accum_steps=ACCUM_STEPS, grad_clip=1.0, use_amp=True
         )
         va = eval_one_epoch(model, val_loader, criterion, device)
 
-        lr_now = optimizer.param_groups[0]["lr"]
-        dt = time.time() - t0
-
-        print(
-            f"Epoch {epoch:03d} | train={tr:.6f} | val={va:.6f} | lr={lr_now:.2e} | time={dt:.1f}s")
-
-        # Scheduler
+        prev_lr = optimizer.param_groups[0]["lr"]
         if scheduler is not None:
             scheduler.step(va)
+        new_lr = optimizer.param_groups[0]["lr"]
 
-        # Save last
+        dt = time.time() - t0
+        print(
+            f"Epoch {epoch:03d} | train={tr:.6f} | val={va:.6f} | lr={new_lr:.2e} | time={dt:.1f}s")
+
+        if new_lr < prev_lr:
+            print(f"🔻 LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
+
         save_ckpt(os.path.join(SAVE_DIR, "last.pth"), model,
                   optimizer, scaler, epoch, best_val, stats, config)
 
-        # Save best
         if va < best_val:
             best_val = va
             save_ckpt(os.path.join(SAVE_DIR, "best.pth"), model,
