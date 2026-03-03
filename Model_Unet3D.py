@@ -1,3 +1,13 @@
+"""
+This file defines a high-quality 3D ResUNet architecture for simulating neuromodulation effects. 
+Key features include:
+- Residual blocks with optional Squeeze-Excitation for better feature recalibration.
+- Group normalization for stable training with small batch sizes.
+- Trilinear upsampling to avoid checkerboard artifacts.
+The model takes a 4-channel input (Density, Speed, Alpha, Source) and outputs a 1-channel pressure map.
+
+"""
+
 # model_unet3d.py
 import torch
 import torch.nn as nn
@@ -5,7 +15,7 @@ import torch.nn.functional as F
 
 
 # -------------------------
-# Normalización estable con batch pequeño
+# Normalization helper (GroupNorm o InstanceNorm)
 # -------------------------
 def norm3d(ch: int, kind: str = "group", groups: int = 8):
     if kind == "instance":
@@ -142,7 +152,7 @@ class ResUNet3D_HQ(nn.Module):
     ):
         super().__init__()
         self.out_positive = out_positive
-        self.out_act = nn.Softplus()
+        self.out_act = nn.Softplus() if out_positive else nn.Identity()
 
         # Encoder
         self.stem = ResBlock3D(
@@ -161,17 +171,17 @@ class ResUNet3D_HQ(nn.Module):
                               norm_kind=norm_kind, use_se=use_se)  # 8^3
 
         # Decoder (concat skips)
-        self.u4 = UpConcat(base * 32, skip_ch=base * 16, out_ch=base *
-                           16, norm_kind=norm_kind, use_se=use_se)  # ->16^3
-        self.u3 = UpConcat(base * 16, skip_ch=base * 8,  out_ch=base * 8,
+        self.u4 = UpConcat(in_ch=base * 32, skip_ch=base * 8, out_ch=base *
+                           8, norm_kind=norm_kind, use_se=use_se)  # ->16^3
+        self.u3 = UpConcat(in_ch=base * 8, skip_ch=base * 4,  out_ch=base * 4,
                            norm_kind=norm_kind, use_se=use_se)  # ->32^3
-        self.u2 = UpConcat(base * 8,  skip_ch=base * 4,  out_ch=base * 4,
+        self.u2 = UpConcat(in_ch=base * 4, skip_ch=base * 2,  out_ch=base * 2,
                            norm_kind=norm_kind, use_se=use_se)  # ->64^3
-        self.u1 = UpConcat(base * 4,  skip_ch=base * 2,  out_ch=base * 2,
+        self.u1 = UpConcat(in_ch=base * 2, skip_ch=base,  out_ch=base,
                            norm_kind=norm_kind, use_se=use_se)  # ->128^3
 
         # Fusión final con stem (concat una última vez para máximo detalle)
-        self.final = ResBlock3D(base * 2 + base, base,
+        self.final = ResBlock3D(base * 2, base,
                                 norm_kind=norm_kind, use_se=use_se)
 
         # Head
@@ -186,25 +196,24 @@ class ResUNet3D_HQ(nn.Module):
 
         m = self.mid(s4)    # 32b, 8^3
 
-        x = self.u4(m, s4)  # 16b, 16^3
-        x = self.u3(x, s3)  # 8b, 32^3
-        x = self.u2(x, s2)  # 4b, 64^3
-        x = self.u1(x, s1)  # 2b, 128^3
+        x = self.u4(m, s3)  # 8b, 16^3
+        x = self.u3(x, s2)  # 4b, 32^3
+        x = self.u2(x, s1)  # 2b, 64^3
+        x = self.u1(x, s0)  # b, 128^3
 
         x = torch.cat([x, s0], dim=1)
         x = self.final(x)
 
         x = self.head(x)
-        if self.out_positive:
-            x = self.out_act(x)
+        x = self.out_act(x)
         return x
 
 
-# Mini test opcional
-"""if __name__ == "__main__":
+if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ResUNet3D_HQ(in_ch=4, out_ch=1, base=16, norm_kind="group", use_se=True).to(device)
+    model = ResUNet3D_HQ(in_ch=4, out_ch=1, base=16, norm_kind="group",
+                         use_se=True, out_positive=True).to(device)
     x = torch.randn(1, 4, 128, 128, 128, device=device)
     with torch.no_grad():
         y = model(x)
-    print("out:", y.shape, "min/max:", float(y.min()), float(y.max()))"""
+    print("y shape:", y.shape, "min/max:", float(y.min()), float(y.max()))
