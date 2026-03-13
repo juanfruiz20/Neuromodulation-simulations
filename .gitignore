@@ -1,0 +1,12 @@
+.venv/
+dataset_TUS_1000
+uv.lock
+main.py
+checkpoints*
+minitest.py
+rank*
+dataset*
+*__pycache__/
+
+*.pth
+

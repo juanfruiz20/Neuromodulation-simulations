@@ -1,0 +1,542 @@
+import os
+import re
+import random
+from typing import List, Dict, Any, Tuple
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+
+from Data_loader import list_npz_files, split_files, TusDataset
+from Model_Unet3D import ResUNet3D_HQ
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+# Carpeta donde están los checkpoints
+CKPT_DIR = r"C:\Users\USUARIO\Desktop\UIC Bioingenieria\TFG\modelosTest"
+
+# EXACTAMENTE 4 checkpoints a comparar
+CKPT_NAMES = [
+    "epoch_090_trainV2.pth",
+    "epoch_060_trainV2.pth",
+    "epoch_080_trainV2.pth",
+    "best.pth",
+]
+
+# Dataset
+DATA_DIR = r"C:\Users\USUARIO\Desktop\UIC Bioingenieria\TFG\dataset_TUS_1000"
+SEED = 123
+TRAIN_RATIO = 0.85
+VAL_RATIO = 0.10
+
+# Hardware
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+USE_AMP = True
+NUM_WORKERS = 0
+PIN_MEMORY = True
+
+# Salida
+OUT_DIR = os.path.join(CKPT_DIR, "compare_4models_visual_V2_contours")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Visualización
+CMAP = "jet"
+SAVE_ABS_ERR = True
+OVERLAY_CONTOURS = True
+DRAW_CROSSHAIR = True
+
+# ---------------------------------------------------------
+# Selección de casos
+# ---------------------------------------------------------
+
+# 1) Si quieres casos concretos por nombre, ponlos aquí
+FORCE_CASE_FILES = [
+    # "sample_0233.npz",
+    # "sample_0101.npz",
+]
+
+# 2) Si quieres aleatorios
+USE_RANDOM_CASES = True
+N_RANDOM_CASES = 6
+
+# 3) Si quieres los primeros N del test
+USE_FIRST_N_CASES = False
+FIRST_N_CASES = 6
+
+
+# =========================================================
+# REPRODUCIBILIDAD
+# =========================================================
+def seed_all(seed: int = 123):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def load_ckpt_raw(path: str, device="cpu"):
+    return torch.load(path, map_location=device)
+
+
+def build_model_from_ckpt_config(cfg: Dict[str, Any]):
+    return ResUNet3D_HQ(
+        in_ch=cfg.get("IN_CH", 4),
+        out_ch=cfg.get("OUT_CH", 1),
+        base=cfg.get("BASE", 16),
+        norm_kind=cfg.get("NORM_KIND", "group"),
+        use_se=cfg.get("USE_SE", True),
+        out_positive=cfg.get("OUT_POSITIVE", True),
+    )
+
+
+def get_y_denorm_mode_and_params(stats: Dict[str, Any]):
+    if stats is None:
+        return ("identity", None)
+
+    if isinstance(stats, dict) and "y" in stats and isinstance(stats["y"], dict):
+        ystats = stats["y"]
+        if "mean" in ystats and "std" in ystats:
+            return ("zscore", (float(ystats["mean"]), float(ystats["std"])))
+        if "mu" in ystats and "sigma" in ystats:
+            return ("zscore", (float(ystats["mu"]), float(ystats["sigma"])))
+        if "min" in ystats and "max" in ystats:
+            return ("minmax", (float(ystats["min"]), float(ystats["max"])))
+
+    zscore_keys = [
+        ("y_mean", "y_std"),
+        ("target_mean", "target_std"),
+        ("mean_y", "std_y"),
+        ("output_mean", "output_std"),
+    ]
+    for k1, k2 in zscore_keys:
+        if k1 in stats and k2 in stats:
+            return ("zscore", (float(stats[k1]), float(stats[k2])))
+
+    minmax_keys = [
+        ("y_min", "y_max"),
+        ("target_min", "target_max"),
+        ("min_y", "max_y"),
+        ("output_min", "output_max"),
+    ]
+    for k1, k2 in minmax_keys:
+        if k1 in stats and k2 in stats:
+            return ("minmax", (float(stats[k1]), float(stats[k2])))
+
+    return ("identity", None)
+
+
+def denormalize_y(y: torch.Tensor, mode: str, params):
+    if mode == "identity" or params is None:
+        return y
+    if mode == "zscore":
+        mean, std = params
+        return y * std + mean
+    if mode == "minmax":
+        y_min, y_max = params
+        return y * (y_max - y_min) + y_min
+    return y
+
+
+def argmax_3d(vol: np.ndarray) -> Tuple[int, int, int]:
+    return np.unravel_index(np.argmax(vol), vol.shape)
+
+
+def pretty_model_name(name: str) -> str:
+    base = os.path.splitext(os.path.basename(name))[0]
+    base = base.replace("_", " ")
+    return base
+
+
+def get_slice_triplet(vol: np.ndarray, cx: int, cy: int, cz: int):
+    """
+    vol shape assumed: [D, H, W]
+    """
+    sag = vol[cx, :, :].T
+    cor = vol[:, cy, :].T
+    axi = vol[:, :, cz].T
+    return sag, cor, axi
+
+
+def get_case_selection(test_files: List[str]) -> List[str]:
+    selected = []
+
+    force_set = set(FORCE_CASE_FILES)
+    for f in test_files:
+        if os.path.basename(f) in force_set:
+            selected.append(f)
+
+    remaining = [f for f in test_files if f not in selected]
+
+    if USE_RANDOM_CASES:
+        random.shuffle(remaining)
+        selected.extend(remaining[:min(N_RANDOM_CASES, len(remaining))])
+
+    if USE_FIRST_N_CASES and len(selected) == 0:
+        selected.extend(test_files[:min(FIRST_N_CASES, len(test_files))])
+
+    # quitar duplicados preservando orden
+    out = []
+    seen = set()
+    for f in selected:
+        if f not in seen:
+            out.append(f)
+            seen.add(f)
+
+    return out
+
+
+# =========================================================
+# CARGA DE MODELOS
+# =========================================================
+def load_models(ckpt_dir: str, ckpt_names: List[str], device: str):
+    if len(ckpt_names) != 4:
+        raise ValueError(
+            "Debes pasar exactamente 4 checkpoints en CKPT_NAMES.")
+
+    models_info = []
+
+    for name in ckpt_names:
+        ckpt_path = os.path.join(ckpt_dir, name)
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"No existe checkpoint: {ckpt_path}")
+
+        raw = load_ckpt_raw(ckpt_path, device="cpu")
+        cfg = raw.get("config", {})
+        stats = raw.get("stats", None)
+
+        model = build_model_from_ckpt_config(cfg).to(device)
+        model.load_state_dict(raw["model"])
+        model.eval()
+
+        y_denorm_mode, y_denorm_params = get_y_denorm_mode_and_params(stats)
+
+        models_info.append({
+            "name": name,
+            "pretty_name": pretty_model_name(name),
+            "path": ckpt_path,
+            "model": model,
+            "stats": stats,
+            "config": cfg,
+            "denorm_mode": y_denorm_mode,
+            "denorm_params": y_denorm_params,
+        })
+
+    return models_info
+
+
+# =========================================================
+# PREDICCIÓN DE UN CASO
+# =========================================================
+@torch.no_grad()
+def predict_single_case(model_info: Dict[str, Any], case_file: str, device: str):
+    ds = TusDataset([case_file], stats=model_info["stats"], normalize=True)
+    loader = DataLoader(
+        ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY and device == "cuda",
+    )
+
+    X, y = next(iter(loader))
+    X = X.to(device, non_blocking=True)
+    y = y.to(device, non_blocking=True)
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(USE_AMP and device == "cuda")):
+        pred = model_info["model"](X).float()
+
+    pred = denormalize_y(
+        pred, model_info["denorm_mode"], model_info["denorm_params"])
+    y = denormalize_y(y, model_info["denorm_mode"],
+                      model_info["denorm_params"])
+
+    pred = pred.clamp_min(0.0)
+    y = y.clamp_min(0.0)
+
+    pred_np = pred.squeeze().detach().cpu().numpy().astype(np.float32)
+    gt_np = y.squeeze().detach().cpu().numpy().astype(np.float32)
+
+    return pred_np, gt_np
+
+
+# =========================================================
+# FIGURAS
+# =========================================================
+def save_comparison_figure(
+    case_name: str,
+    gt_np: np.ndarray,
+    preds: List[np.ndarray],
+    model_names: List[str],
+    out_path: str,
+    cmap: str = "jet",
+    overlay_contours: bool = True,
+    crosshair: bool = True,
+):
+    idx_gt = np.array(argmax_3d(gt_np))
+    cx, cy, cz = idx_gt.tolist()
+
+    vols = [gt_np] + preds
+    row_titles = ["GT"] + [pretty_model_name(n) for n in model_names]
+
+    vmax = max(float(gt_np.max()), max(float(p.max()) for p in preds))
+    vmin = 0.0
+
+    gt_level = 0.5 * float(gt_np.max())
+
+    nrows = len(vols)
+    ncols = 3
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(17.5, 3.0 * nrows))
+
+    if nrows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    im = None
+    col_titles = ["Sagittal", "Coronal", "Axial"]
+
+    # coordenadas de la cruz sobre el pico GT
+    # sag = vol[cx,:,:].T -> x=cy, y=cz
+    # cor = vol[:,cy,:].T -> x=cx, y=cz
+    # axi = vol[:,:,cz].T -> x=cx, y=cy
+    cross_coords = {
+        "Sagittal": (cy, cz),
+        "Coronal": (cx, cz),
+        "Axial": (cx, cy),
+    }
+
+    gt_sag, gt_cor, gt_axi = get_slice_triplet(gt_np, cx, cy, cz)
+    gt_slices = [gt_sag, gt_cor, gt_axi]
+
+    for r, (vol, row_title) in enumerate(zip(vols, row_titles)):
+        sag, cor, axi = get_slice_triplet(vol, cx, cy, cz)
+        slices = [sag, cor, axi]
+
+        for c in range(ncols):
+            ax = axes[r, c]
+            im = ax.imshow(
+                slices[c],
+                origin="lower",
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                aspect="equal",
+            )
+
+            if r == 0:
+                ax.set_title(col_titles[c], fontsize=12, pad=8)
+
+            if c == 0:
+                ax.set_ylabel(row_title, fontsize=11)
+
+            if crosshair:
+                x0, y0 = cross_coords[col_titles[c]]
+                ax.plot(x0, y0, marker="+", markersize=10,
+                        markeredgewidth=1.6, color="white")
+
+            # Contornos solo para las predicciones
+            if overlay_contours and r > 0:
+                pred_level = 0.5 * float(vol.max())
+                pred_sag, pred_cor, pred_axi = get_slice_triplet(
+                    vol, cx, cy, cz)
+                pred_slices = [pred_sag, pred_cor, pred_axi]
+
+                try:
+                    ax.contour(gt_slices[c], levels=[
+                               gt_level], colors="white", linewidths=1.0)
+                except Exception:
+                    pass
+
+                try:
+                    ax.contour(pred_slices[c], levels=[
+                               pred_level], colors="red", linewidths=1.0)
+                except Exception:
+                    pass
+
+            ax.axis("off")
+
+    fig.suptitle(f"{case_name} | GT vs 4 models", fontsize=15, y=0.995)
+
+    # deja espacio real para la barra a la derecha
+    plt.tight_layout(rect=[0.02, 0.02, 0.90, 0.975])
+
+    # colorbar completamente fuera
+    cax = fig.add_axes([0.92, 0.12, 0.02, 0.76])
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("Amplitude", fontsize=11)
+    cbar.ax.tick_params(labelsize=9)
+
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_abs_error_figure(
+    case_name: str,
+    gt_np: np.ndarray,
+    preds: List[np.ndarray],
+    model_names: List[str],
+    out_path: str,
+    cmap: str = "jet",
+    crosshair: bool = True,
+):
+    idx_gt = np.array(argmax_3d(gt_np))
+    cx, cy, cz = idx_gt.tolist()
+
+    errs = [np.abs(p - gt_np) for p in preds]
+    row_titles = [pretty_model_name(n) for n in model_names]
+
+    vmax = max(float(e.max()) for e in errs)
+    vmin = 0.0
+
+    nrows = len(errs)
+    ncols = 3
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(17.5, 3.0 * nrows))
+
+    if nrows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    im = None
+    col_titles = ["Sagittal", "Coronal", "Axial"]
+
+    cross_coords = {
+        "Sagittal": (cy, cz),
+        "Coronal": (cx, cz),
+        "Axial": (cx, cy),
+    }
+
+    for r, (err, row_title) in enumerate(zip(errs, row_titles)):
+        sag, cor, axi = get_slice_triplet(err, cx, cy, cz)
+        slices = [sag, cor, axi]
+
+        for c in range(ncols):
+            ax = axes[r, c]
+            im = ax.imshow(
+                slices[c],
+                origin="lower",
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                aspect="equal",
+            )
+
+            if r == 0:
+                ax.set_title(col_titles[c], fontsize=12, pad=8)
+
+            if c == 0:
+                ax.set_ylabel(f"AbsErr\n{row_title}", fontsize=11)
+
+            if crosshair:
+                x0, y0 = cross_coords[col_titles[c]]
+                ax.plot(x0, y0, marker="+", markersize=10,
+                        markeredgewidth=1.6, color="white")
+
+            ax.axis("off")
+
+    fig.suptitle(f"{case_name} | Absolute error of 4 models",
+                 fontsize=15, y=0.995)
+
+    plt.tight_layout(rect=[0.02, 0.02, 0.90, 0.975])
+
+    cax = fig.add_axes([0.92, 0.12, 0.02, 0.76])
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("|Pred - GT|", fontsize=11)
+    cbar.ax.tick_params(labelsize=9)
+
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    seed_all(SEED)
+
+    print("Usando dispositivo:", DEVICE)
+
+    # split
+    files = list_npz_files(DATA_DIR)
+    train_files, val_files, test_files = split_files(
+        files,
+        seed=SEED,
+        train_ratio=TRAIN_RATIO,
+        val_ratio=VAL_RATIO
+    )
+
+    print(
+        f"Total sims: {len(files)} | train={len(train_files)} | val={len(val_files)} | test={len(test_files)}")
+
+    selected_cases = get_case_selection(test_files)
+    if len(selected_cases) == 0:
+        raise ValueError("No se seleccionó ningún caso para visualizar.")
+
+    print("\nCasos seleccionados:")
+    for f in selected_cases:
+        print(" -", os.path.basename(f))
+
+    # modelos
+    models_info = load_models(CKPT_DIR, CKPT_NAMES, DEVICE)
+    model_names = [m["name"] for m in models_info]
+
+    print("\nModelos cargados:")
+    for m in models_info:
+        print(" -", m["name"])
+
+    # por cada caso: GT + 4 preds
+    for case_file in selected_cases:
+        case_name = os.path.splitext(os.path.basename(case_file))[0]
+        print(f"\nProcesando {case_name}...")
+
+        preds = []
+        gt_ref = None
+
+        for model_info in models_info:
+            pred_np, gt_np = predict_single_case(model_info, case_file, DEVICE)
+            preds.append(pred_np)
+
+            if gt_ref is None:
+                gt_ref = gt_np
+            else:
+                if gt_ref.shape != gt_np.shape:
+                    raise ValueError(
+                        f"GT con shape distinta en {case_name} para modelo {model_info['name']}"
+                    )
+
+        out_cmp = os.path.join(OUT_DIR, f"{case_name}_GT_vs_4models.png")
+        save_comparison_figure(
+            case_name=case_name,
+            gt_np=gt_ref,
+            preds=preds,
+            model_names=model_names,
+            out_path=out_cmp,
+            cmap=CMAP,
+            overlay_contours=OVERLAY_CONTOURS,
+            crosshair=DRAW_CROSSHAIR,
+        )
+
+        if SAVE_ABS_ERR:
+            out_err = os.path.join(OUT_DIR, f"{case_name}_AbsErr_4models.png")
+            save_abs_error_figure(
+                case_name=case_name,
+                gt_np=gt_ref,
+                preds=preds,
+                model_names=model_names,
+                out_path=out_err,
+                cmap=CMAP,
+                crosshair=DRAW_CROSSHAIR,
+            )
+
+    print("\nListo.")
+    print("Figuras guardadas en:")
+    print(OUT_DIR)
+
+
+if __name__ == "__main__":
+    main()
