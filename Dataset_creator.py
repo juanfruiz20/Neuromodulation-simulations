@@ -409,7 +409,7 @@ def main():
     rng = np.random.default_rng(SEED)
 
     # Grid
-    Nx, Ny, Nz = 128, 128, 128
+    Nx, Ny, Nz = 256, 256, 256
     dx = 0.5e-3
     kgrid = kWaveGrid([Nx, Ny, Nz], [dx, dx, dx])
 
@@ -468,7 +468,7 @@ def main():
 
     sim_opts = SimulationOptions(
         save_to_disk=True,
-        pml_inside=False,
+        pml_inside=True,
         pml_size=PML_SIZE,
         data_cast="single",
     )
