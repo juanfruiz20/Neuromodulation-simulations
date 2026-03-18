@@ -410,6 +410,7 @@ def main():
 
     # Grid
     Nx, Ny, Nz = 128, 128, 128
+    Nx, Ny, Nz = 128, 128, 128 
     dx = 0.5e-3
     kgrid = kWaveGrid([Nx, Ny, Nz], [dx, dx, dx])
 
@@ -423,7 +424,7 @@ def main():
     R_CONST = 30e-3           # ✅ R = 30 mm
     r_T = 25e-3
     GAP_MIN, GAP_MAX = 0.5e-3, 2.0e-3
-    BOWL_THICKNESS = 2 * dx   # ✅ thickness = 2*dx
+    BOWL_THICKNESS = 1 * dx   # ✅ thickness = 2*dx
 
     if r_T > (half_interior - margin_to_pml):
         raise RuntimeError(
