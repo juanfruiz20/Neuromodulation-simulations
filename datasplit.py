@@ -1,107 +1,96 @@
 import os
-import numpy as np
 import shutil
-from pathlib import Path
+import numpy as np
 
+# =========================================================
+# CONFIGURACIÓN
+# =========================================================
+SOURCE_DIR = "dataset_TUS_dx10_f400_R60"  # Tu carpeta original
+OUTPUT_DIR = "dataset_TUS_SplitV1"          # Nueva carpeta donde se guardará la división
 
-def split_dataset_stratified(
-    source_dir="dataset_TUS_dx1_TAC_35mm_100_water_only",
-    output_dir="dataset_split",
-    train_ratio=0.8,
-    val_ratio=0.1,
-    seed=123
-):
-    source_path = Path(source_dir)
-    output_path = Path(output_dir)
+TRAIN_RATIO = 0.8
+VAL_RATIO = 0.1
+TEST_RATIO = 0.1 # El resto
+SEED = 42 # Semilla para que la división sea reproducible
+# =========================================================
 
-    # 1. Obtener todos los archivos .npz
-    npz_files = list(source_path.glob("sample_*.npz"))
-    if not npz_files:
-        print(f"No se encontraron archivos .npz en {source_dir}")
-        return
+def main():
+    if not os.path.exists(SOURCE_DIR):
+        raise FileNotFoundError(f"❌ No se encontró la carpeta original: {SOURCE_DIR}")
 
-    print(
-        f"[INFO] Analizando {len(npz_files)} archivos para separar por clase...")
+    # 1. Crear las carpetas de destino
+    for split in ["train", "val", "test"]:
+        os.makedirs(os.path.join(OUTPUT_DIR, split), exist_ok=True)
 
+    # 2. Escanear y clasificar los archivos rápidamente
+    print(f"🔍 Escaneando archivos en '{SOURCE_DIR}'...")
     water_cases = []
     skull_cases = []
 
-    # 2. Leer cada archivo para clasificarlo
-    for f in npz_files:
-        try:
-            data = np.load(f)
-            is_water = data['water_only'].item()
+    archivos_npz = [f for f in os.listdir(SOURCE_DIR) if f.endswith(".npz")]
 
-            if is_water == 1:
-                water_cases.append(f)
+    for file in archivos_npz:
+        filepath = os.path.join(SOURCE_DIR, file)
+        
+        # Leemos SOLO la variable 'is_water_only', evitando cargar los mapas 3D a la RAM
+        with np.load(filepath) as data:
+            if data["is_water_only"]:
+                water_cases.append(filepath)
             else:
-                skull_cases.append(f)
-        except Exception as e:
-            print(f"[WARN] Error leyendo {f.name}: {e}")
+                skull_cases.append(filepath)
 
-    print(
-        f"[INFO] Encontrados {len(water_cases)} casos 'solo agua' y {len(skull_cases)} casos 'con cráneo'.")
+    print(f"📊 Total encontrados: {len(skull_cases)} casos de Cráneo | {len(water_cases)} casos de Solo Agua.")
 
-    # 3. Barajar aleatoriamente usando una semilla fija
-    rng = np.random.default_rng(seed)
-    rng.shuffle(water_cases)
-    rng.shuffle(skull_cases)
+    # 3. Barajar aleatoriamente para evitar sesgos de orden de generación
+    np.random.seed(SEED)
+    np.random.shuffle(water_cases)
+    np.random.shuffle(skull_cases)
 
-    # 4. Función auxiliar para calcular los índices de corte
-    def get_splits(items):
-        n = len(items)
-        n_train = int(n * train_ratio)
-        n_val = int(n * val_ratio)
+    # 4. Función auxiliar para calcular índices y repartir
+    def get_splits(file_list):
+        total = len(file_list)
+        n_train = int(total * TRAIN_RATIO)
+        n_val = int(total * VAL_RATIO)
+        
+        return (
+            file_list[:n_train], 
+            file_list[n_train : n_train + n_val], 
+            file_list[n_train + n_val:]
+        )
 
-        train_items = items[:n_train]
-        val_items = items[n_train:n_train+n_val]
-        test_items = items[n_train+n_val:]
+    # Repartimos cada grupo por separado para garantizar homogeneidad
+    water_train, water_val, water_test = get_splits(water_cases)
+    skull_train, skull_val, skull_test = get_splits(skull_cases)
 
-        return train_items, val_items, test_items
-
-    train_w, val_w, test_w = get_splits(water_cases)
-    train_s, val_s, test_s = get_splits(skull_cases)
-
-    # 5. Combinar listas
-    splits = {
-        "train": train_w + train_s,
-        "val": val_w + val_s,
-        "test": test_w + test_s
+    # 5. Agrupamos los diccionarios de copiado
+    copy_plan = {
+        "train": water_train + skull_train,
+        "val": water_val + skull_val,
+        "test": water_test + skull_test
     }
 
-    # 6. Copiar los archivos a las nuevas carpetas
-    for split_name, files in splits.items():
-        split_dir = output_path / split_name
-        split_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n[INFO] Copiando {len(files)} archivos a {split_dir}...")
+    # 6. Copiar los archivos
+    print("\n🚀 Iniciando el copiado estructurado a 'train', 'val' y 'test'...")
+    
+    for split_name, files in copy_plan.items():
+        dest_folder = os.path.join(OUTPUT_DIR, split_name)
+        
+        # Opcional: Barajar una vez más dentro del split para que agua y cráneo queden mezclados
+        np.random.shuffle(files)
+        
         for i, f in enumerate(files):
-            shutil.copy2(f, split_dir / f.name)
+            filename = os.path.basename(f)
+            dest_path = os.path.join(dest_folder, filename)
+            
+            # shutil.copy2 copia el archivo y preserva los metadatos de fecha/hora
+            shutil.copy2(f, dest_path)
+            
+        # Imprimir resumen de la carpeta
+        n_water = sum(1 for f in files if f in water_cases)
+        n_skull = sum(1 for f in files if f in skull_cases)
+        print(f"   ✅ {split_name.upper():<6} -> Total: {len(files):<4} (Cráneo: {n_skull:<3} | Agua: {n_water:<3})")
 
-            if (i + 1) % 100 == 0 or (i + 1) == len(files):
-                print(f"  -> {i + 1}/{len(files)} copiados.")
-
-    # 7. Copiar el archivo de metadatos a la raíz del nuevo dataset
-    metadata_src = source_path / "dataset_metadata.json"
-    if metadata_src.exists():
-        print(f"\n[INFO] Copiando archivo de metadatos: {metadata_src.name}")
-        shutil.copy2(metadata_src, output_path / metadata_src.name)
-    else:
-        print(
-            f"\n[WARN] No se encontró {metadata_src.name} en la carpeta original.")
-
-    print("\n[DONE] ¡Partición completada con éxito!")
-    print(f"Distribución final de 'solo agua' / 'con cráneo':")
-    print(f" - Train : {len(train_w)} / {len(train_s)}")
-    print(f" - Val   : {len(val_w)} / {len(val_s)}")
-    print(f" - Test  : {len(test_w)} / {len(test_s)}")
-
+    print(f"\n🎉 ¡División estratificada completada con éxito en '{OUTPUT_DIR}'!")
 
 if __name__ == "__main__":
-    split_dataset_stratified(
-        source_dir="dataset_TUS_dx1_TAC_35mm_100_water_only",
-        output_dir="dataset_TUS_split",
-        train_ratio=0.8,
-        val_ratio=0.1,
-        seed=123
-    )
+    main()

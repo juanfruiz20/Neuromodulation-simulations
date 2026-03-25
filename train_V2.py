@@ -14,8 +14,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from Data_loader import list_npz_files, split_files, compute_stats, TusDataset
-from Model_Unet3D import ResUNet3D_HQ
+from Data_loaderV2 import TusDataset
+from Unet3D_V2 import ResUNet3D_HQ
 
 # --- AMP GradScaler compatible (PyTorch nuevo/viejo) ---
 try:
@@ -739,8 +739,8 @@ def main():
     # =========================
     SEED = 123
 
-    DATA_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_1000"
-    SAVE_DIR = "checkpoints_unet_hq_focusaware_stable_visual"
+    
+    SAVE_DIR = "checkpoints_unet_V2"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     BATCH_SIZE = 1
@@ -790,20 +790,20 @@ def main():
         except Exception:
             pass
 
+    
+
     # =========================
     # DATA
     # =========================
-    files = list_npz_files(DATA_DIR)
-    train_files, val_files, test_files = split_files(
-        files, seed=SEED, train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO
-    )
-    print(
-        f"Total sims: {len(files)} | train {len(train_files)} | val {len(val_files)} | test {len(test_files)}")
+    TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
+    VAL_DIR   = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
+    TEST_DIR  = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
 
-    stats = compute_stats(train_files, max_samples=128, seed=0)
+    train_ds = TusDataset(TRAIN_DIR)
+    val_ds   = TusDataset(VAL_DIR)
+    test_ds  = TusDataset(TEST_DIR)
 
-    train_ds = TusDataset(train_files, stats=stats, normalize=True)
-    val_ds = TusDataset(val_files, stats=stats, normalize=True)
+    print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
     train_loader = DataLoader(
         train_ds,
@@ -824,12 +824,13 @@ def main():
         persistent_workers=(NUM_WORKERS > 0),
         prefetch_factor=2 if NUM_WORKERS > 0 else None
     )
+    
 
     # =========================
     # MODEL
     # =========================
     model = ResUNet3D_HQ(
-        in_ch=4,
+        in_ch=2,
         out_ch=1,
         base=BASE,
         norm_kind="group",
@@ -906,10 +907,9 @@ def main():
     # =========================
     start_epoch = 0
     best_val = float("inf")
-
+    stats = None
     config = {
         "SEED": SEED,
-        "DATA_DIR": DATA_DIR,
         "TRAIN_RATIO": TRAIN_RATIO,
         "VAL_RATIO": VAL_RATIO,
         "BATCH_SIZE": BATCH_SIZE,
@@ -1025,7 +1025,7 @@ def main():
             print(f"✅ New best val: {best_val:.6f}")
 
         # Guardado periódico de checkpoints
-        if (SAVE_EVERY_N_EPOCHS > 0 and epoch % SAVE_EVERY_N_EPOCHS == 0) or (epoch in SPECIFIC_SAVE_EPOCHS):
+        if (SAVE_EVERY_N_EPOCHS >= 50 and epoch % SAVE_EVERY_N_EPOCHS == 0) or (epoch in SPECIFIC_SAVE_EPOCHS):
             save_ckpt(
                 os.path.join(SAVE_DIR, f"epoch_{epoch:03d}.pth"),
                 model, optimizer, scaler, epoch, best_val, stats, config
