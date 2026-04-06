@@ -17,8 +17,13 @@ from Unet3D_V2 import ResUNet3D_HQ
 try:
     from skimage.metrics import structural_similarity as skimage_ssim
     HAS_SKIMAGE = True
-except Exception:
-    HAS_SKIMAGE = False
+except ImportError:
+    try:
+        from skimage.measure import compare_ssim as skimage_ssim
+        HAS_SKIMAGE = True
+    except ImportError:
+        HAS_SKIMAGE = False
+        skimage_ssim = None
 
 
 # =========================================================
@@ -100,7 +105,8 @@ class TusTestDataset(Dataset):
         self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
         if len(self.files) == 0:
-            raise RuntimeError(f"No se encontraron archivos .npz en: {data_dir}")
+            raise RuntimeError(
+                f"No se encontraron archivos .npz en: {data_dir}")
 
     def __len__(self):
         return len(self.files)
@@ -280,7 +286,8 @@ def compute_metrics_one_sample(
     pred_brain_crop = crop_to_mask_bbox(pred_brain_vol, brain_mask)
     gt_brain_crop = crop_to_mask_bbox(gt_brain_vol, brain_mask)
 
-    ssim_brain = compute_ssim_safe(pred_brain_crop, gt_brain_crop, data_range=1.0)
+    ssim_brain = compute_ssim_safe(
+        pred_brain_crop, gt_brain_crop, data_range=1.0)
 
     # -----------------------------
     # Peak in brain
