@@ -25,7 +25,7 @@ except Exception:
 # CONFIG
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_V2"
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_V2_expB"
 OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain_v2")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

@@ -1,6 +1,6 @@
 import pandas as pd
 
-df = pd.read_csv("checkpoint_ranking.csv")
+df = pd.read_csv(r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_V2_expB/test_metrics_brain_v2/checkpoint_ranking.csv")
 
 cols = [
     "checkpoint",
