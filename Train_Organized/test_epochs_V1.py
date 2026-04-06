@@ -189,27 +189,15 @@ def compute_ssim_safe(a: np.ndarray, b: np.ndarray, data_range: float = 1.0) -> 
     if not HAS_SKIMAGE:
         return float("nan")
 
+    # Check if arrays have valid shape for SSIM
+    if min(a.shape) < 7 or min(b.shape) < 7:
+        return float("nan")
+
     try:
         return float(skimage_ssim(a, b, data_range=data_range))
-    except Exception:
-        pass
-
-    vals = []
-    for z in range(a.shape[0]):
-        az = a[z]
-        bz = b[z]
-
-        if min(az.shape) < 7:
-            continue
-
-        try:
-            vals.append(float(skimage_ssim(az, bz, data_range=data_range)))
-        except Exception:
-            continue
-
-    if len(vals) == 0:
+    except Exception as e:
+        print(f"⚠️ SSIM computation failed: {e}")
         return float("nan")
-    return float(np.mean(vals))
 
 
 def dice_score(mask_a: np.ndarray, mask_b: np.ndarray, eps: float = 1e-8) -> float:
@@ -286,8 +274,12 @@ def compute_metrics_one_sample(
     pred_brain_crop = crop_to_mask_bbox(pred_brain_vol, brain_mask)
     gt_brain_crop = crop_to_mask_bbox(gt_brain_vol, brain_mask)
 
-    ssim_brain = compute_ssim_safe(
-        pred_brain_crop, gt_brain_crop, data_range=1.0)
+    # Ensure crops have minimum size before SSIM
+    if min(pred_brain_crop.shape) < 7 or min(gt_brain_crop.shape) < 7:
+        ssim_brain = float("nan")
+    else:
+        ssim_brain = compute_ssim_safe(
+            pred_brain_crop, gt_brain_crop, data_range=1.0)
 
     # -----------------------------
     # Peak in brain
