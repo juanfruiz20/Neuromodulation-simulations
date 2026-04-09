@@ -2,6 +2,7 @@ import os
 import csv
 import math
 import glob
+import re
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -30,8 +31,8 @@ except ImportError:
 # CONFIG
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDV2"
-OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain_expC")
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_tus_v1"
+OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain_v2")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -41,33 +42,37 @@ DX_MM = 1.0
 NUM_WORKERS = 0
 PIN_MEMORY = True
 
+# rango de epochs que quieres evaluar
+EPOCH_MIN = 10
+EPOCH_MAX = 50
+
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
 # =========================================================
-# AUTO-DISCOVER DE CHECKPOINTS
+# AUTO-DISCOVER DE CHECKPOINTS cGAN (solo G, sin best/last)
 # =========================================================
-def discover_checkpoints(ckpt_dir: str) -> List[str]:
-    names = []
-
-    for fixed_name in ["best.pth", "last.pth"]:
-        p = os.path.join(ckpt_dir, fixed_name)
-        if os.path.exists(p):
-            names.append(fixed_name)
-
-    epoch_paths = sorted(glob.glob(os.path.join(ckpt_dir, "epoch_*.pth")))
-    names.extend([os.path.basename(p) for p in epoch_paths])
+def discover_checkpoints(ckpt_dir: str, epoch_min: int = 10, epoch_max: int = 50) -> List[str]:
+    """
+    Busca solo checkpoints del generador de la cGAN con nombre:
+      epoch_XXX_G.pth
+    y filtra entre epoch_min y epoch_max.
+    """
+    epoch_paths = sorted(glob.glob(os.path.join(ckpt_dir, "epoch_*_G.pth")))
 
     out = []
-    seen = set()
-    for n in names:
-        if n not in seen:
-            out.append(n)
-            seen.add(n)
+    for p in epoch_paths:
+        name = os.path.basename(p)
+        m = re.match(r"epoch_(\d+)_G\.pth$", name)
+        if m:
+            ep = int(m.group(1))
+            if epoch_min <= ep <= epoch_max:
+                out.append(name)
+
     return out
 
 
-CKPT_NAMES = discover_checkpoints(CKPT_DIR)
+CKPT_NAMES = discover_checkpoints(CKPT_DIR, epoch_min=EPOCH_MIN, epoch_max=EPOCH_MAX)
 
 
 # =========================================================
@@ -105,8 +110,7 @@ class TusTestDataset(Dataset):
         self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
         if len(self.files) == 0:
-            raise RuntimeError(
-                f"No se encontraron archivos .npz en: {data_dir}")
+            raise RuntimeError(f"No se encontraron archivos .npz en: {data_dir}")
 
     def __len__(self):
         return len(self.files)
@@ -152,7 +156,6 @@ class TusTestDataset(Dataset):
 def load_model(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    # Mantiene tu arquitectura importada desde Model_Unet3D
     model = ResUNet3D_HQ(
         in_ch=2,
         out_ch=1,
@@ -189,14 +192,13 @@ def compute_ssim_safe(a: np.ndarray, b: np.ndarray, data_range: float = 1.0) -> 
     if not HAS_SKIMAGE:
         return float("nan")
 
-    # Check if arrays have valid shape for SSIM
     if min(a.shape) < 7 or min(b.shape) < 7:
         return float("nan")
 
     try:
         return float(skimage_ssim(a, b, data_range=data_range))
     except Exception as e:
-        print(f"⚠️ SSIM computation failed: {e}")
+        print(f"� SSIM computation failed: {e}")
         return float("nan")
 
 
@@ -223,9 +225,6 @@ def compute_metrics_one_sample(
     gt = gt.astype(np.float32)
     brain_mask = (brain_mask > 0.5)
 
-    # -----------------------------
-    # Global metrics
-    # -----------------------------
     mse_global = float(np.mean((pred - gt) ** 2))
     mae_global = float(np.mean(np.abs(pred - gt)))
     ssim_global = compute_ssim_safe(pred, gt, data_range=1.0)
@@ -237,9 +236,6 @@ def compute_metrics_one_sample(
         "is_water_only": int(is_water_only),
     }
 
-    # -----------------------------
-    # Brain-only metrics
-    # -----------------------------
     if is_water_only or brain_mask.sum() == 0:
         out.update({
             "mse_brain": float("nan"),
@@ -274,16 +270,11 @@ def compute_metrics_one_sample(
     pred_brain_crop = crop_to_mask_bbox(pred_brain_vol, brain_mask)
     gt_brain_crop = crop_to_mask_bbox(gt_brain_vol, brain_mask)
 
-    # Ensure crops have minimum size before SSIM
     if min(pred_brain_crop.shape) < 7 or min(gt_brain_crop.shape) < 7:
         ssim_brain = float("nan")
     else:
-        ssim_brain = compute_ssim_safe(
-            pred_brain_crop, gt_brain_crop, data_range=1.0)
+        ssim_brain = compute_ssim_safe(pred_brain_crop, gt_brain_crop, data_range=1.0)
 
-    # -----------------------------
-    # Peak in brain
-    # -----------------------------
     gt_peak_idx = get_peak_index_masked(gt, brain_mask)
     pred_peak_idx = get_peak_index_masked(pred, brain_mask)
 
@@ -300,9 +291,6 @@ def compute_metrics_one_sample(
     )
     peak_loc_err_mm_brain = peak_loc_err_vox_brain * dx_mm
 
-    # -----------------------------
-    # Dice focus
-    # -----------------------------
     gt_thr50 = 0.50 * gt_peak_val_brain
     pr_thr50 = 0.50 * pred_peak_val_brain
 
@@ -497,6 +485,7 @@ def main():
     print("CKPT_DIR:", CKPT_DIR)
     print("OUT_DIR:", OUT_DIR)
     print("DX_MM:", DX_MM)
+    print(f"Epoch range: {EPOCH_MIN} -> {EPOCH_MAX}")
     print("Checkpoints found:", CKPT_NAMES)
 
     if len(CKPT_NAMES) == 0:
@@ -573,7 +562,7 @@ def main():
 
     ranking_rows = build_ranking(ranking_rows)
 
-    ranking_csv = os.path.join(OUT_DIR, "checkpoint_ranking.csv")
+    ranking_csv = os.path.join(OUT_DIR, f"checkpoint_ranking_epoch_{EPOCH_MIN:03d}_{EPOCH_MAX:03d}.csv")
     with open(ranking_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(ranking_rows[0].keys()))
         writer.writeheader()

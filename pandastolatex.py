@@ -1,12 +1,20 @@
 import pandas as pd
 import glob
+import os
 
-# 1. Get a list of your 5 files
-# You can use a wildcard like 'results_*.csv' or list them manually
-files = [r'/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_V2_expB/test_metrics_brain_v2/epoch_070_summary.csv', r'/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_V2_expB/test_metrics_brain_v2/epoch_080_summary.csv', r'/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_V2_expB/test_metrics_brain_v2/epoch_090_summary.csv', r'/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_V2_expB/test_metrics_brain_v2/epoch_100_summary.csv', r'/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_V2_expB/test_metrics_brain_v2/best_summary.csv']
+# 1. Define the directory path once
+folder_path = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_ExpC_V2/test_metrics_brain_expC"
 
-# 2. Read and combine them
+# 2. Get all summary files (excluding 'last' if you want)
+# This finds every file ending in _summary.csv
+all_files = glob.glob(os.path.join(folder_path, "*_summary.csv"))
+
+# Filter out 'last' if it exists in the list
+files = [f for f in all_files if 'last_summary' not in f]
+
+# 3. Sort them (optional, but keeps things organized)
+files.sort()
+
+# 4. Read and combine
 combined_df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-
-# 3. Save the master CSV
-combined_df.to_csv('master_results.csv', index=False)
+combined_df.to_csv('master_results_expc2.csv', index=False)

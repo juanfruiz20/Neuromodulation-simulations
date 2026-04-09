@@ -620,61 +620,80 @@ def train_one_epoch_cgan(
     grad_clip_G=2.0,
     grad_clip_D=2.0,
     use_amp=True,
+    d_update_every=2,
 ):
     G.train()
     D.train()
 
     sums = {"g_total": 0.0, "g_phys": 0.0, "g_adv": 0.0, "d_total": 0.0}
     n_batches = 0
+    n_d_updates = 0
 
-    for X, y in loader:
+    for batch_idx, (X, y) in enumerate(loader, start=1):
         X = X.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        # -----------------------------
-        # 1) Update D
-        # -----------------------------
-        opt_D.zero_grad(set_to_none=True)
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if (use_amp and device == "cuda")
+            else nullcontext()
+        )
 
-        amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if (
-            use_amp and device == "cuda") else nullcontext()
+        # =====================================================
+        # 1) Update D only if:
+        #    - adversarial branch is active
+        #    - this batch is scheduled for D update
+        # =====================================================
+        do_d_update = (lambda_adv > 0.0) and ((batch_idx % d_update_every) == 0)
 
-        with amp_ctx:
-            y_hat = G(X).detach()
-            d_real = D(X, y)
-            d_fake = D(X, y_hat)
-            loss_D = d_loss_lsgan(d_real, d_fake)
-
-        if torch.isfinite(loss_D):
-            if device == "cuda" and use_amp:
-                scaler_D.scale(loss_D).backward()
-                scaler_D.unscale_(opt_D)
-                if grad_clip_D is not None and grad_clip_D > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        D.parameters(), max_norm=float(grad_clip_D))
-                scaler_D.step(opt_D)
-                scaler_D.update()
-            else:
-                loss_D.backward()
-                if grad_clip_D is not None and grad_clip_D > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        D.parameters(), max_norm=float(grad_clip_D))
-                opt_D.step()
-        else:
-            print(f"⚠️ Non-finite D loss en epoch {epoch}. Batch saltado.")
+        if do_d_update:
             opt_D.zero_grad(set_to_none=True)
-            continue
 
-        # -----------------------------
-        # 2) Update G
-        # -----------------------------
+            with amp_ctx:
+                y_hat_detached = G(X).detach()
+                d_real = D(X, y)
+                d_fake = D(X, y_hat_detached)
+                loss_D = d_loss_lsgan(d_real, d_fake)
+
+            if torch.isfinite(loss_D):
+                if device == "cuda" and use_amp:
+                    scaler_D.scale(loss_D).backward()
+                    scaler_D.unscale_(opt_D)
+                    if grad_clip_D is not None and grad_clip_D > 0:
+                        torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=float(grad_clip_D))
+                    scaler_D.step(opt_D)
+                    scaler_D.update()
+                else:
+                    loss_D.backward()
+                    if grad_clip_D is not None and grad_clip_D > 0:
+                        torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=float(grad_clip_D))
+                    opt_D.step()
+
+                d_loss_value = float(loss_D.item())
+                n_d_updates += 1
+
+            else:
+                print(f"⚠️ Non-finite D loss en epoch {epoch}, batch {batch_idx}. Batch saltado.")
+                opt_D.zero_grad(set_to_none=True)
+                continue
+        else:
+            d_loss_value = 0.0
+
+        # =====================================================
+        # 2) Update G every batch
+        # =====================================================
         opt_G.zero_grad(set_to_none=True)
 
         with amp_ctx:
             y_hat = G(X)
             loss_phys = criterion_phys(y_hat, y, epoch=epoch)
-            d_fake_for_g = D(X, y_hat)
-            loss_adv = g_loss_lsgan(d_fake_for_g)
+
+            if lambda_adv > 0.0:
+                d_fake_for_g = D(X, y_hat)
+                loss_adv = g_loss_lsgan(d_fake_for_g)
+            else:
+                loss_adv = torch.zeros((), device=device, dtype=torch.float32)
+
             loss_G = loss_phys + lambda_adv * loss_adv
 
         if torch.isfinite(loss_G):
@@ -682,32 +701,36 @@ def train_one_epoch_cgan(
                 scaler_G.scale(loss_G).backward()
                 scaler_G.unscale_(opt_G)
                 if grad_clip_G is not None and grad_clip_G > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        G.parameters(), max_norm=float(grad_clip_G))
+                    torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=float(grad_clip_G))
                 scaler_G.step(opt_G)
                 scaler_G.update()
             else:
                 loss_G.backward()
                 if grad_clip_G is not None and grad_clip_G > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        G.parameters(), max_norm=float(grad_clip_G))
+                    torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=float(grad_clip_G))
                 opt_G.step()
         else:
-            print(f"⚠️ Non-finite G loss en epoch {epoch}. Batch saltado.")
+            print(f"⚠️ Non-finite G loss en epoch {epoch}, batch {batch_idx}. Batch saltado.")
             opt_G.zero_grad(set_to_none=True)
             continue
 
         sums["g_total"] += float(loss_G.item())
         sums["g_phys"] += float(loss_phys.item())
         sums["g_adv"] += float(loss_adv.item())
-        sums["d_total"] += float(loss_D.item())
+        sums["d_total"] += d_loss_value
         n_batches += 1
 
     if n_batches == 0:
         return {k: float("inf") for k in sums.keys()}
 
-    return {k: v / n_batches for k, v in sums.items()}
-
+    out = {
+        "g_total": sums["g_total"] / max(1, n_batches),
+        "g_phys": sums["g_phys"] / max(1, n_batches),
+        "g_adv": sums["g_adv"] / max(1, n_batches),
+        # D se promedia solo sobre las veces que realmente se actualizó
+        "d_total": (sums["d_total"] / max(1, n_d_updates)) if n_d_updates > 0 else 0.0,
+    }
+    return out
 
 @torch.no_grad()
 def eval_generator(G, loader, criterion_phys, device, epoch, use_amp=True):
@@ -792,10 +815,10 @@ def main():
     EPOCHS = 100
 
     LR_G = 1e-4
-    LR_D = 5e-5
+    LR_D = 1e-5
     WEIGHT_DECAY_G = 1e-4
     WEIGHT_DECAY_D = 0.0
-
+    D_UPDATE_EVERY = 2
     BASE_G = 16
     USE_SE = True
     OUT_POSITIVE = True
@@ -806,7 +829,7 @@ def main():
     PLATEAU_FACTOR_G = 0.5
 
     WARM_START_G = True
-    WARM_START_G_PATH = r"checkpoints_unet_V2_expB/best.pth"
+    WARM_START_G_PATH = r"checkpoints_unet_V2/last.pth"
 
     RESUME_CGAN = False
     RESUME_G_PATH = os.path.join(SAVE_DIR, "last_G.pth")
@@ -820,9 +843,9 @@ def main():
     VISUAL_FIXED_INDICES = (0, 5, 10)
     VISUAL_SAVE_RAW_NPZ = True
 
-    ADV_START_EPOCH = 6
-    ADV_FULL_EPOCH = 20
-    ADV_MAX = 0.01
+    ADV_START_EPOCH = 10
+    ADV_FULL_EPOCH = 30
+    ADV_MAX = 0.001
 
     # -------------------------
     # DATA
@@ -936,6 +959,7 @@ def main():
         "WARM_START_G_PATH": WARM_START_G_PATH,
         "GENERATOR": "ResUNet3D_HQ",
         "DISCRIMINATOR": "PatchDiscriminator3D",
+        "D_UPDATE_EVERY": D_UPDATE_EVERY,
     }
 
     with open(os.path.join(SAVE_DIR, "config.json"), "w", encoding="utf-8") as f:
@@ -966,7 +990,8 @@ def main():
             lambda_adv=lambda_adv,
             grad_clip_G=2.0,
             grad_clip_D=2.0,
-            use_amp=True
+            use_amp=True,
+            d_update_every=D_UPDATE_EVERY,  
         )
 
         val_g_phys, val_comp = eval_generator(
