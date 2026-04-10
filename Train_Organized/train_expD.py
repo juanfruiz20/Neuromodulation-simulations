@@ -753,14 +753,14 @@ def main():
     # =========================
     SEED = 123
 
-    SAVE_DIR = "checkpoints_unet_expDexpC"
+    SAVE_DIR = "checkpoints_unet_expDexpC2"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
     VAL_DIR   = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
     TEST_DIR  = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
 
-    OLD_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_ExpC"
+    OLD_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_ExpC/epoch_050.pth"
     BATCH_SIZE = 1
     NUM_WORKERS = 2
     PIN_MEMORY = True
