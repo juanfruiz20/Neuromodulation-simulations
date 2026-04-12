@@ -2,15 +2,17 @@ import os
 import csv
 import math
 import glob
-import re
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from scipy.ndimage import binary_fill_holes
 
 from Unet3D_V2 import ResUNet3D_HQ
+
 
 # =========================================================
 # SSIM opcional
@@ -31,48 +33,55 @@ except ImportError:
 # CONFIG
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_tus_v1"
-OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain_v2")
 
+# Pon aqu� la carpeta de los checkpoints que quieras evaluar
+# Puede ser de UNet normal o de GAN refiner
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_refiner_expDexpB"
+
+OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Si el dataset se gener� con dx=1 mm, d�jalo en 1.0
-DX_MM = 1.0
+# Si quieres forzarlo manualmente, d�jalo aqu�.
+# Si el checkpoint GAN trae DX_MM en config, se usar� ese.
+DX_MM_DEFAULT = 1.0
 
 NUM_WORKERS = 0
 PIN_MEMORY = True
-
-# rango de epochs que quieres evaluar
-EPOCH_MIN = 10
-EPOCH_MAX = 50
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
 # =========================================================
-# AUTO-DISCOVER DE CHECKPOINTS cGAN (solo G, sin best/last)
+# AUTO-DISCOVER DE CHECKPOINTS
 # =========================================================
-def discover_checkpoints(ckpt_dir: str, epoch_min: int = 10, epoch_max: int = 50) -> List[str]:
-    """
-    Busca solo checkpoints del generador de la cGAN con nombre:
-      epoch_XXX_G.pth
-    y filtra entre epoch_min y epoch_max.
-    """
-    epoch_paths = sorted(glob.glob(os.path.join(ckpt_dir, "epoch_*_G.pth")))
+def discover_checkpoints(ckpt_dir: str) -> List[str]:
+    names = []
+
+    fixed_candidates = [
+        "best.pth",
+        "last.pth",
+        "best_gan_refiner.pth",
+        "last_gan_refiner.pth",
+    ]
+
+    for fixed_name in fixed_candidates:
+        p = os.path.join(ckpt_dir, fixed_name)
+        if os.path.exists(p):
+            names.append(fixed_name)
+
+    epoch_paths = sorted(glob.glob(os.path.join(ckpt_dir, "epoch_*.pth")))
+    names.extend([os.path.basename(p) for p in epoch_paths])
 
     out = []
-    for p in epoch_paths:
-        name = os.path.basename(p)
-        m = re.match(r"epoch_(\d+)_G\.pth$", name)
-        if m:
-            ep = int(m.group(1))
-            if epoch_min <= ep <= epoch_max:
-                out.append(name)
-
+    seen = set()
+    for n in names:
+        if n not in seen:
+            out.append(n)
+            seen.add(n)
     return out
 
 
-CKPT_NAMES = discover_checkpoints(CKPT_DIR, epoch_min=EPOCH_MIN, epoch_max=EPOCH_MAX)
+CKPT_NAMES = discover_checkpoints(CKPT_DIR)
 
 
 # =========================================================
@@ -137,6 +146,7 @@ class TusTestDataset(Dataset):
 
         brain = reconstruct_brain_mask(skull, is_water_only)
 
+        # OJO: mismo orden de canales que el entrenamiento
         X = np.stack([src, skull], axis=0)   # [2, D, H, W]
         y = y[np.newaxis, ...]               # [1, D, H, W]
         brain = brain[np.newaxis, ...]       # [1, D, H, W]
@@ -151,9 +161,110 @@ class TusTestDataset(Dataset):
 
 
 # =========================================================
+# MODELOS DEL GAN REFINER
+# =========================================================
+class ConvBlock3D(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, norm: bool = True):
+        super().__init__()
+        layers = [
+            nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=not norm)
+        ]
+        if norm:
+            num_groups = 8 if out_ch >= 8 else 1
+            layers.append(nn.GroupNorm(num_groups=num_groups, num_channels=out_ch))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ResidualBlock3D(nn.Module):
+    def __init__(self, ch: int):
+        super().__init__()
+        num_groups = 8 if ch >= 8 else 1
+        self.conv1 = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
+        self.gn1 = nn.GroupNorm(num_groups=num_groups, num_channels=ch)
+        self.conv2 = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
+        self.gn2 = nn.GroupNorm(num_groups=num_groups, num_channels=ch)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x):
+        r = x
+        x = self.act(self.gn1(self.conv1(x)))
+        x = self.gn2(self.conv2(x))
+        x = self.act(x + r)
+        return x
+
+
+class DownBlock3D(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            ConvBlock3D(in_ch, out_ch, stride=2, norm=True),
+            ConvBlock3D(out_ch, out_ch, stride=1, norm=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UpBlock3D(nn.Module):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1 = ConvBlock3D(in_ch + skip_ch, out_ch, stride=1, norm=True)
+        self.conv2 = ConvBlock3D(out_ch, out_ch, stride=1, norm=True)
+
+    def forward(self, x, skip):
+        x = F.interpolate(x, size=skip.shape[-3:], mode="trilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+
+class ResidualRefiner3D(nn.Module):
+    def __init__(self, x_ch: int = 2):
+        super().__init__()
+        in_ch = x_ch + 1  # X + y_base
+
+        self.enc1 = nn.Sequential(
+            ConvBlock3D(in_ch, 16, stride=1, norm=True),
+            ConvBlock3D(16, 16, stride=1, norm=True),
+        )
+        self.down1 = DownBlock3D(16, 32)
+        self.down2 = DownBlock3D(32, 64)
+
+        self.bottleneck = nn.Sequential(
+            ResidualBlock3D(64),
+            ResidualBlock3D(64),
+        )
+
+        self.up1 = UpBlock3D(64, 32, 32)
+        self.up2 = UpBlock3D(32, 16, 16)
+
+        self.out_conv = nn.Conv3d(16, 1, kernel_size=1)
+
+    def forward(self, x, y_base):
+        z = torch.cat([x, y_base], dim=1)
+
+        s1 = self.enc1(z)
+        s2 = self.down1(s1)
+        s3 = self.down2(s2)
+
+        b = self.bottleneck(s3)
+
+        u1 = self.up1(b, s2)
+        u2 = self.up2(u1, s1)
+
+        delta = torch.tanh(self.out_conv(u2))
+        return delta
+
+
+# =========================================================
 # HELPERS
 # =========================================================
-def load_model(ckpt_path: str, device: str):
+def load_base_unet_from_ckpt(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device)
 
     model = ResUNet3D_HQ(
@@ -168,6 +279,91 @@ def load_model(ckpt_path: str, device: str):
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
     return model, ckpt
+
+
+def load_predictor(ckpt_path: str, device: str):
+    """
+    Devuelve:
+      predictor_type: "unet" o "gan_refiner"
+      predictor: modelo o dict de modelos
+      ckpt
+      dx_mm
+      alpha_resid
+    """
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # -----------------------------------------------------
+    # Caso 1: checkpoint de UNet normal
+    # -----------------------------------------------------
+    if "model" in ckpt:
+        model = ResUNet3D_HQ(
+            in_ch=2,
+            out_ch=1,
+            base=16,
+            norm_kind="group",
+            use_se=True,
+            out_positive=True,
+        ).to(device)
+
+        model.load_state_dict(ckpt["model"], strict=True)
+        model.eval()
+
+        dx_mm = float(ckpt.get("config", {}).get("DX_MM", DX_MM_DEFAULT))
+        alpha_resid = None
+        return "unet", model, ckpt, dx_mm, alpha_resid
+
+    # -----------------------------------------------------
+    # Caso 2: checkpoint de GAN refiner
+    # -----------------------------------------------------
+    if "refiner" in ckpt:
+        base_ckpt_path = ckpt.get("base_ckpt_path", None)
+        if base_ckpt_path is None:
+            raise RuntimeError(
+                f"El checkpoint {ckpt_path} parece GAN refiner pero no trae 'base_ckpt_path'."
+            )
+        if not os.path.exists(base_ckpt_path):
+            raise RuntimeError(
+                f"No se encuentra el checkpoint base del UNet: {base_ckpt_path}"
+            )
+
+        base_model, _ = load_base_unet_from_ckpt(base_ckpt_path, device)
+
+        refiner = ResidualRefiner3D(x_ch=2).to(device)
+        refiner.load_state_dict(ckpt["refiner"], strict=True)
+        refiner.eval()
+
+        predictor = {
+            "base_model": base_model,
+            "refiner": refiner,
+        }
+
+        dx_mm = float(ckpt.get("config", {}).get("DX_MM", DX_MM_DEFAULT))
+        alpha_resid = float(ckpt.get("alpha_resid", 0.15))
+        return "gan_refiner", predictor, ckpt, dx_mm, alpha_resid
+
+    raise RuntimeError(
+        f"No reconozco el formato del checkpoint: {ckpt_path}. "
+        f"Claves encontradas: {list(ckpt.keys())}"
+    )
+
+
+def forward_predictor(predictor_type: str, predictor, X: torch.Tensor, alpha_resid: float = None):
+    if predictor_type == "unet":
+        pred = predictor(X)
+        pred = pred.clamp_min(0.0)
+        return pred
+
+    if predictor_type == "gan_refiner":
+        base_model = predictor["base_model"]
+        refiner = predictor["refiner"]
+
+        y_base = base_model(X).clamp_min(0.0)
+        delta = refiner(X, y_base)
+        pred = y_base + alpha_resid * delta
+        pred = pred.clamp_min(0.0)
+        return pred
+
+    raise ValueError(f"predictor_type no soportado: {predictor_type}")
 
 
 def get_peak_index_masked(vol: np.ndarray, mask: np.ndarray) -> Tuple[int, int, int]:
@@ -225,6 +421,9 @@ def compute_metrics_one_sample(
     gt = gt.astype(np.float32)
     brain_mask = (brain_mask > 0.5)
 
+    # -----------------------------
+    # Global metrics
+    # -----------------------------
     mse_global = float(np.mean((pred - gt) ** 2))
     mae_global = float(np.mean(np.abs(pred - gt)))
     ssim_global = compute_ssim_safe(pred, gt, data_range=1.0)
@@ -236,6 +435,9 @@ def compute_metrics_one_sample(
         "is_water_only": int(is_water_only),
     }
 
+    # -----------------------------
+    # Brain-only metrics
+    # -----------------------------
     if is_water_only or brain_mask.sum() == 0:
         out.update({
             "mse_brain": float("nan"),
@@ -275,6 +477,9 @@ def compute_metrics_one_sample(
     else:
         ssim_brain = compute_ssim_safe(pred_brain_crop, gt_brain_crop, data_range=1.0)
 
+    # -----------------------------
+    # Peak in brain
+    # -----------------------------
     gt_peak_idx = get_peak_index_masked(gt, brain_mask)
     pred_peak_idx = get_peak_index_masked(pred, brain_mask)
 
@@ -291,6 +496,9 @@ def compute_metrics_one_sample(
     )
     peak_loc_err_mm_brain = peak_loc_err_vox_brain * dx_mm
 
+    # -----------------------------
+    # Dice focus
+    # -----------------------------
     gt_thr50 = 0.50 * gt_peak_val_brain
     pr_thr50 = 0.50 * pred_peak_val_brain
 
@@ -409,7 +617,7 @@ def rankdata_asc(values: List[float]) -> np.ndarray:
 
 @torch.no_grad()
 def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
-    model, ckpt = load_model(ckpt_path, device)
+    predictor_type, predictor, ckpt, dx_mm, alpha_resid = load_predictor(ckpt_path, device)
     all_rows = []
 
     for batch in loader:
@@ -419,8 +627,12 @@ def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
         is_water_only = bool(batch["is_water_only"][0])
         file_name = batch["file_name"][0]
 
-        pred = model(X)
-        pred = pred.clamp_min(0.0)
+        pred = forward_predictor(
+            predictor_type=predictor_type,
+            predictor=predictor,
+            X=X,
+            alpha_resid=alpha_resid,
+        )
 
         pred_np = pred[0, 0].detach().cpu().numpy()
         gt_np = y[0, 0].detach().cpu().numpy()
@@ -430,13 +642,13 @@ def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
             pred=pred_np,
             gt=gt_np,
             brain_mask=brain_np,
-            dx_mm=DX_MM,
+            dx_mm=dx_mm,
             is_water_only=is_water_only,
         )
         metrics["file"] = file_name
         all_rows.append(metrics)
 
-    return all_rows, ckpt
+    return all_rows, ckpt, predictor_type, dx_mm
 
 
 def build_ranking(ranking_rows: List[Dict[str, float]]) -> List[Dict[str, float]]:
@@ -484,8 +696,6 @@ def main():
     print("TEST_DIR:", TEST_DIR)
     print("CKPT_DIR:", CKPT_DIR)
     print("OUT_DIR:", OUT_DIR)
-    print("DX_MM:", DX_MM)
-    print(f"Epoch range: {EPOCH_MIN} -> {EPOCH_MAX}")
     print("Checkpoints found:", CKPT_NAMES)
 
     if len(CKPT_NAMES) == 0:
@@ -511,7 +721,7 @@ def main():
             continue
 
         print(f"\nEvaluando {ckpt_name} ...")
-        rows, ckpt = evaluate_checkpoint(ckpt_path, test_loader, DEVICE)
+        rows, ckpt, predictor_type, dx_mm = evaluate_checkpoint(ckpt_path, test_loader, DEVICE)
 
         per_sample_csv = os.path.join(
             OUT_DIR, f"{os.path.splitext(ckpt_name)[0]}_per_sample.csv"
@@ -521,6 +731,8 @@ def main():
         summary = summarize_metrics(rows)
         summary["checkpoint"] = ckpt_name
         summary["epoch"] = int(ckpt.get("epoch", -1))
+        summary["predictor_type"] = predictor_type
+        summary["dx_mm"] = dx_mm
 
         summary_csv = os.path.join(
             OUT_DIR, f"{os.path.splitext(ckpt_name)[0]}_summary.csv"
@@ -530,6 +742,8 @@ def main():
         ranking_rows.append({
             "checkpoint": ckpt_name,
             "epoch": int(ckpt.get("epoch", -1)),
+            "predictor_type": predictor_type,
+            "dx_mm": dx_mm,
             "n_samples": int(summary["n_samples"]),
             "n_water_only": int(summary["n_water_only"]),
             "n_non_water_only": int(summary["n_non_water_only"]),
@@ -548,6 +762,7 @@ def main():
 
         print(
             f"{ckpt_name} | "
+            f"type={predictor_type} | "
             f"peak_loc_mm_brain={summary['mean_peak_loc_err_mm_brain']:.4f} | "
             f"peak_rel_brain={summary['mean_peak_rel_err_brain']:.4f} | "
             f"mae_brain={summary['mean_mae_brain']:.4f} | "
@@ -562,7 +777,7 @@ def main():
 
     ranking_rows = build_ranking(ranking_rows)
 
-    ranking_csv = os.path.join(OUT_DIR, f"checkpoint_ranking_epoch_{EPOCH_MIN:03d}_{EPOCH_MAX:03d}.csv")
+    ranking_csv = os.path.join(OUT_DIR, "checkpoint_ranking.csv")
     with open(ranking_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(ranking_rows[0].keys()))
         writer.writeheader()
@@ -572,7 +787,7 @@ def main():
     print("\nTop checkpoints:")
     for row in ranking_rows[:5]:
         print(
-            f"  {row['checkpoint']} | epoch={row['epoch']} | "
+            f"  {row['checkpoint']} | epoch={row['epoch']} | type={row['predictor_type']} | "
             f"score={row['composite_score']:.3f} | "
             f"peak_loc_mm={row['mean_peak_loc_err_mm_brain']:.4f} | "
             f"peak_rel={row['mean_peak_rel_err_brain']:.4f} | "

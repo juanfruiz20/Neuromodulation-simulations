@@ -1,860 +1,925 @@
+# train_residual_cgan_tus.py
+# =========================================================
+# Residual cGAN 3D para refinar un UNet ya entrenado
+# Base:
+#   y_base = UNet(x)
+# Refinamiento:
+#   delta  = G(x, y_base)
+#   y_fake = ReLU(y_base + alpha * delta)
+#
+# El UNet base se congela.
+# El GAN aprende solo una correcci�n peque�a.
+# =========================================================
+
 import os
-import json
+import csv
+import math
+import glob
 import time
 import random
-import csv
-from contextlib import nullcontext
+from typing import Dict, List, Tuple
 
 import numpy as np
-import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
+from scipy.ndimage import binary_fill_holes
 
-from Data_loaderV2 import TusDataset
 from Unet3D_V2 import ResUNet3D_HQ
 
+
+# =========================================================
+# SSIM opcional
+# =========================================================
 try:
-    from torch.amp import GradScaler
-except Exception:
-    from torch.cuda.amp import GradScaler
+    from skimage.metrics import structural_similarity as skimage_ssim
+    HAS_SKIMAGE = True
+except ImportError:
+    try:
+        from skimage.measure import compare_ssim as skimage_ssim
+        HAS_SKIMAGE = True
+    except ImportError:
+        HAS_SKIMAGE = False
+        skimage_ssim = None
 
 
 # =========================================================
-# Reproducibilidad
+# CONFIG
 # =========================================================
-def seed_all(seed: int = 123):
+TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
+VAL_DIR   = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
+
+# Checkpoint del UNet base ya entrenado
+BASE_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/epoch_030.pth"
+
+OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_refiner_expDexpB"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 42
+
+EXPECTED_SHAPE = (128, 128, 128)
+DX_MM = 1.0  # cambia si tu dataset tiene otra resoluci�n
+
+NUM_WORKERS = 0
+PIN_MEMORY = torch.cuda.is_available()
+
+BATCH_SIZE = 1
+EPOCHS = 40
+
+LR_G = 2e-4
+LR_D = 2e-4
+BETAS = (0.5, 0.999)
+WEIGHT_DECAY = 0.0
+GRAD_CLIP = 1.0
+
+# Cu�nto puede corregir el refinador
+ALPHA_RESID = 0.15
+
+# Warmup: al principio sin p�rdida adversarial
+ADV_WARMUP_EPOCHS = 3
+
+# Pesos de la loss del generador
+LAMBDA_BRAIN = 20.0
+LAMBDA_GLOBAL = 5.0
+LAMBDA_PEAK = 2.0
+LAMBDA_LOC = 2.0
+LAMBDA_ADV = 0.05
+
+SOFTARGMAX_BETA = 20.0
+
+SAVE_EVERY = 1
+
+
+# =========================================================
+# UTILIDADES
+# =========================================================
+def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
+def compute_ssim_safe(a: np.ndarray, b: np.ndarray, data_range: float = 1.0) -> float:
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+
+    if not HAS_SKIMAGE:
+        return float("nan")
+
+    if min(a.shape) < 7 or min(b.shape) < 7:
+        return float("nan")
+
+    try:
+        return float(skimage_ssim(a, b, data_range=data_range))
+    except Exception:
+        return float("nan")
+
+
+def dice_score(mask_a: np.ndarray, mask_b: np.ndarray, eps: float = 1e-8) -> float:
+    mask_a = mask_a.astype(bool)
+    mask_b = mask_b.astype(bool)
+    inter = np.logical_and(mask_a, mask_b).sum()
+    denom = mask_a.sum() + mask_b.sum()
+    return float((2.0 * inter) / (denom + eps))
+
+
+def crop_to_mask_bbox(vol: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    coords = np.argwhere(mask > 0)
+    if len(coords) == 0:
+        return vol
+    zmin, ymin, xmin = coords.min(axis=0)
+    zmax, ymax, xmax = coords.max(axis=0)
+    return vol[zmin:zmax + 1, ymin:ymax + 1, xmin:xmax + 1]
+
+
+def get_peak_index_masked(vol: np.ndarray, mask: np.ndarray) -> Tuple[int, int, int]:
+    masked = np.where(mask > 0, vol, -np.inf)
+    flat_idx = int(np.argmax(masked))
+    return np.unravel_index(flat_idx, vol.shape)
+
+
+def reconstruct_brain_mask(mask_skull: np.ndarray, is_water_only: bool) -> np.ndarray:
+    skull = mask_skull > 0.5
+
+    if is_water_only or skull.sum() == 0:
+        return np.zeros_like(mask_skull, dtype=np.float32)
+
+    filled = binary_fill_holes(skull)
+    brain = np.logical_and(filled, np.logical_not(skull))
+    return brain.astype(np.float32)
+
+
+def masked_l1_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    pred, target, mask: [B,1,D,H,W]
+    Si una muestra no tiene brain mask, usa loss global para esa muestra.
+    """
+    vals = []
+    for b in range(pred.shape[0]):
+        m = mask[b, 0] > 0.5
+        if m.sum() == 0:
+            vals.append(torch.abs(pred[b:b+1] - target[b:b+1]).mean())
+        else:
+            vals.append(torch.abs(pred[b, 0][m] - target[b, 0][m]).mean())
+    return torch.stack(vals).mean()
+
+
+def masked_peak_values(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    vol, mask: [B,1,D,H,W]
+    Devuelve [B]
+    """
+    peaks = []
+    for b in range(vol.shape[0]):
+        m = mask[b, 0] > 0.5
+        if m.sum() == 0:
+            peaks.append(vol[b, 0].amax())
+        else:
+            peaks.append(vol[b, 0][m].amax())
+    return torch.stack(peaks, dim=0)
+
+
+def peak_value_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    pred_peak = masked_peak_values(pred, mask)
+    gt_peak = masked_peak_values(target, mask)
+    return torch.abs(pred_peak - gt_peak).mean()
+
+
+def soft_argmax_3d_single(vol: torch.Tensor, mask: torch.Tensor = None, beta: float = 20.0) -> torch.Tensor:
+    """
+    vol: [D,H,W]
+    devuelve coords [3] en rango [-1, 1] para (z, y, x)
+    """
+    D, H, W = vol.shape
+
+    if mask is not None and mask.sum() > 0:
+        v = vol.masked_fill(~mask.bool(), -1e9)
+    else:
+        v = vol
+
+    flat = (beta * v.reshape(-1)).softmax(dim=0)
+
+    z_lin = torch.linspace(-1.0, 1.0, D, device=vol.device, dtype=vol.dtype)
+    y_lin = torch.linspace(-1.0, 1.0, H, device=vol.device, dtype=vol.dtype)
+    x_lin = torch.linspace(-1.0, 1.0, W, device=vol.device, dtype=vol.dtype)
+    zz, yy, xx = torch.meshgrid(z_lin, y_lin, x_lin, indexing="ij")
+
+    z = (flat * zz.reshape(-1)).sum()
+    y = (flat * yy.reshape(-1)).sum()
+    x = (flat * xx.reshape(-1)).sum()
+    return torch.stack([z, y, x], dim=0)
+
+
+def location_loss_softargmax(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, beta: float = 20.0) -> torch.Tensor:
+    vals = []
+    for b in range(pred.shape[0]):
+        m = mask[b, 0] > 0.5
+        pcoord = soft_argmax_3d_single(pred[b, 0], m if m.sum() > 0 else None, beta=beta)
+        gcoord = soft_argmax_3d_single(target[b, 0], m if m.sum() > 0 else None, beta=beta)
+        vals.append(torch.abs(pcoord - gcoord).mean())
+    return torch.stack(vals).mean()
+
+
 # =========================================================
-# Helpers
+# DATASET
 # =========================================================
-def grad3d(x: torch.Tensor):
-    dx = x[:, :, 1:, :, :] - x[:, :, :-1, :, :]
-    dy = x[:, :, :, 1:, :] - x[:, :, :, :-1, :]
-    dz = x[:, :, :, :, 1:] - x[:, :, :, :, :-1]
+class TusGanDataset(Dataset):
+    """
+    Espera en cada .npz:
+      - source_mask
+      - mask_skull
+      - p_max_norm
+      - is_water_only
 
-    dx = F.pad(dx, (0, 0, 0, 0, 0, 1))
-    dy = F.pad(dy, (0, 0, 0, 1, 0, 0))
-    dz = F.pad(dz, (0, 1, 0, 0, 0, 0))
-    return dx, dy, dz
+    Construye brain_mask desde mask_skull.
+    """
 
-
-def masked_mean(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6):
-    return (x * mask).sum() / (mask.sum() + eps)
-
-
-def ramp_linear(epoch: int, start: int, end: int) -> float:
-    if epoch < start:
-        return 0.0
-    if epoch >= end:
-        return 1.0
-    return float(epoch - start) / float(max(1, end - start))
-
-
-def interp_linear(alpha: float, start_value: float, end_value: float) -> float:
-    alpha = float(max(0.0, min(1.0, alpha)))
-    return (1.0 - alpha) * float(start_value) + alpha * float(end_value)
-
-
-def make_focus_roi(target: torch.Tensor, frac: float, min_thr: float, dilate_ks: int):
-    peak = target.amax(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6)
-    thr = torch.maximum(peak * frac, torch.full_like(peak, min_thr))
-    roi = (target >= thr).float()
-
-    if dilate_ks is not None and dilate_ks > 1:
-        roi = F.max_pool3d(roi, kernel_size=dilate_ks,
-                           stride=1, padding=dilate_ks // 2)
-        roi = (roi > 0).float()
-
-    return roi, peak
-
-
-def make_peak_mask(target: torch.Tensor, frac: float = 0.92):
-    peak = target.amax(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6)
-    mask = (target >= peak * frac).float()
-    return mask, peak
-
-
-def approx_max(x: torch.Tensor, mask: torch.Tensor = None, beta: float = 20.0):
-    x = x.float()
-    B, C, D, H, W = x.shape
-    flat = x.view(B, C, -1)
-
-    if mask is not None:
-        mask = mask.float().view(B, C, -1)
-        neg_val = torch.full_like(flat, -50.0)
-        flat = torch.where(mask > 0, flat, neg_val)
-
-    m = flat.max(dim=-1, keepdim=True).values
-    out = m + torch.logsumexp(beta * (flat - m), dim=-1, keepdim=True) / beta
-    return out
-
-
-def soft_argmax3d(x: torch.Tensor, mask: torch.Tensor = None, beta: float = 20.0):
-    x = x.float()
-    B, C, D, H, W = x.shape
-    flat = x.view(B, C, -1)
-
-    if mask is not None:
-        mask = mask.float().view(B, C, -1)
-        neg_val = torch.full_like(flat, -50.0)
-        flat = torch.where(mask > 0, flat, neg_val)
-
-    m = flat.max(dim=-1, keepdim=True).values
-    logits = beta * (flat - m)
-    prob = torch.softmax(logits, dim=-1)
-
-    zz = torch.linspace(-1.0, 1.0, D, device=x.device, dtype=torch.float32)
-    yy = torch.linspace(-1.0, 1.0, H, device=x.device, dtype=torch.float32)
-    xx = torch.linspace(-1.0, 1.0, W, device=x.device, dtype=torch.float32)
-    zz, yy, xx = torch.meshgrid(zz, yy, xx, indexing="ij")
-
-    coords = torch.stack([zz, yy, xx], dim=0).view(1, 1, 3, -1)
-    exp_coords = (prob.unsqueeze(2) * coords).sum(dim=-1)
-    return exp_coords.squeeze(1)
-
-
-# =========================================================
-# Loss física base (ExpB)
-# =========================================================
-class StableFocusAwareTUSLoss_ExpB(nn.Module):
-    def __init__(
-        self,
-        lambda_global=0.8,
-        lambda_focus=2.0,
-        lambda_peak=0.8,
-        lambda_loc=0.6,
-        lambda_grad=0.08,
-
-        wide_frac=0.50,
-        wide_min_thr=0.08,
-        wide_dilate_ks=7,
-
-        mid_frac=0.60,
-        mid_min_thr=0.08,
-        mid_dilate_ks=5,
-
-        tight_frac=0.75,
-        tight_min_thr=0.10,
-        tight_dilate_ks=3,
-
-        peak_frac=0.92,
-
-        global_peak_weight=4.0,
-        global_peak_gamma=2.0,
-
-        peak_warmup_start=5,
-        peak_warmup_end=18,
-        loc_warmup_start=8,
-        loc_warmup_end=20,
-
-        beta_peak_start=10.0,
-        beta_peak_end=30.0,
-        beta_loc_start=10.0,
-        beta_loc_end=50.0,
-
-        eps=1e-6,
-    ):
+    def __init__(self, data_dir: str, expected_shape=(128, 128, 128)):
         super().__init__()
+        self.data_dir = data_dir
+        self.expected_shape = tuple(expected_shape)
+        self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
-        self.lambda_global = float(lambda_global)
-        self.lambda_focus = float(lambda_focus)
-        self.lambda_peak = float(lambda_peak)
-        self.lambda_loc = float(lambda_loc)
-        self.lambda_grad = float(lambda_grad)
+        if len(self.files) == 0:
+            raise RuntimeError(f"No se encontraron archivos .npz en: {data_dir}")
 
-        self.wide_frac = float(wide_frac)
-        self.wide_min_thr = float(wide_min_thr)
-        self.wide_dilate_ks = int(wide_dilate_ks)
+    def __len__(self):
+        return len(self.files)
 
-        self.mid_frac = float(mid_frac)
-        self.mid_min_thr = float(mid_min_thr)
-        self.mid_dilate_ks = int(mid_dilate_ks)
+    def __getitem__(self, i):
+        path = self.files[i]
 
-        self.tight_frac = float(tight_frac)
-        self.tight_min_thr = float(tight_min_thr)
-        self.tight_dilate_ks = int(tight_dilate_ks)
+        with np.load(path) as d:
+            src = d["source_mask"].astype(np.float32)
+            skull = d["mask_skull"].astype(np.float32)
+            y = d["p_max_norm"].astype(np.float32)
+            is_water_only = bool(np.array(d["is_water_only"]).item())
 
-        self.peak_frac = float(peak_frac)
+        for name, arr in [
+            ("source_mask", src),
+            ("mask_skull", skull),
+            ("p_max_norm", y),
+        ]:
+            if arr.shape != self.expected_shape:
+                raise RuntimeError(
+                    f"Shape inv�lida en {os.path.basename(path)} | "
+                    f"{name}: {arr.shape} | esperado: {self.expected_shape}"
+                )
 
-        self.global_peak_weight = float(global_peak_weight)
-        self.global_peak_gamma = float(global_peak_gamma)
+        brain = reconstruct_brain_mask(skull, is_water_only)
 
-        self.peak_warmup_start = int(peak_warmup_start)
-        self.peak_warmup_end = int(peak_warmup_end)
-        self.loc_warmup_start = int(loc_warmup_start)
-        self.loc_warmup_end = int(loc_warmup_end)
-
-        self.beta_peak_start = float(beta_peak_start)
-        self.beta_peak_end = float(beta_peak_end)
-        self.beta_loc_start = float(beta_loc_start)
-        self.beta_loc_end = float(beta_loc_end)
-
-        self.eps = float(eps)
-
-    def get_schedule(self, epoch: int):
-        r_peak = ramp_linear(epoch, self.peak_warmup_start,
-                             self.peak_warmup_end)
-        r_loc = ramp_linear(epoch, self.loc_warmup_start, self.loc_warmup_end)
-
-        beta_peak = interp_linear(
-            r_peak, self.beta_peak_start, self.beta_peak_end)
-        beta_loc = interp_linear(r_loc, self.beta_loc_start, self.beta_loc_end)
+        # IMPORTANT�SIMO:
+        # Mant�n el mismo orden de canales que usaste para entrenar el UNet base.
+        # Aqu� asumo [source_mask, mask_skull], igual que en tu script de test.
+        X = np.stack([src, skull], axis=0)   # [2, D, H, W]
+        y = y[np.newaxis, ...]               # [1, D, H, W]
+        brain = brain[np.newaxis, ...]       # [1, D, H, W]
 
         return {
-            "r_peak": r_peak,
-            "r_loc": r_loc,
-            "beta_peak": beta_peak,
-            "beta_loc": beta_loc,
-            "lambda_peak_eff": self.lambda_peak * r_peak,
-            "lambda_loc_eff": self.lambda_loc * r_loc,
+            "X": torch.from_numpy(X),
+            "y": torch.from_numpy(y),
+            "brain_mask": torch.from_numpy(brain),
+            "is_water_only": is_water_only,
+            "file_name": os.path.basename(path),
         }
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, epoch: int = 1, return_dict: bool = False):
-        pred32 = pred.float()
-        target32 = target.float()
-        pred_pos = pred32.clamp_min(0.0)
-
-        sched = self.get_schedule(epoch)
-
-        focus_roi_wide, peak = make_focus_roi(
-            target32, frac=self.wide_frac, min_thr=self.wide_min_thr, dilate_ks=self.wide_dilate_ks
-        )
-        focus_roi_mid, _ = make_focus_roi(
-            target32, frac=self.mid_frac, min_thr=self.mid_min_thr, dilate_ks=self.mid_dilate_ks
-        )
-        focus_roi_tight, _ = make_focus_roi(
-            target32, frac=self.tight_frac, min_thr=self.tight_min_thr, dilate_ks=self.tight_dilate_ks
-        )
-        peak_mask, _ = make_peak_mask(target32, frac=self.peak_frac)
-
-        rel = (target32 / peak).clamp(0.0, 1.0)
-        w_global = 1.0 + self.global_peak_weight * \
-            rel.pow(self.global_peak_gamma)
-        loss_global = (torch.abs(pred_pos - target32) * w_global).mean()
-
-        focus_num = masked_mean(
-            (pred_pos - target32).pow(2), focus_roi_wide, eps=self.eps)
-        focus_den = masked_mean(target32.pow(
-            2), focus_roi_wide, eps=self.eps).clamp_min(self.eps)
-        loss_focus = focus_num / focus_den
-
-        pdx, pdy, pdz = grad3d(pred_pos)
-        tdx, tdy, tdz = grad3d(target32)
-
-        grad_diff = torch.abs(pdx - tdx) + \
-            torch.abs(pdy - tdy) + torch.abs(pdz - tdz)
-        grad_ref = torch.abs(tdx) + torch.abs(tdy) + torch.abs(tdz)
-
-        grad_num = masked_mean(grad_diff, focus_roi_mid, eps=self.eps)
-        grad_den = masked_mean(grad_ref, focus_roi_mid,
-                               eps=self.eps).clamp_min(self.eps)
-        loss_grad = grad_num / grad_den
-
-        if sched["lambda_peak_eff"] > 0.0:
-            pred_peak = approx_max(
-                pred_pos, mask=peak_mask, beta=sched["beta_peak"]).view(-1, 1)
-            targ_peak = approx_max(
-                target32, mask=peak_mask, beta=sched["beta_peak"]).view(-1, 1)
-            loss_peak = (torch.abs(pred_peak - targ_peak) /
-                         (torch.abs(targ_peak) + self.eps)).mean()
-        else:
-            loss_peak = torch.zeros(
-                (), device=pred.device, dtype=torch.float32)
-
-        if sched["lambda_loc_eff"] > 0.0:
-            pred_loc = soft_argmax3d(
-                pred_pos, mask=focus_roi_tight, beta=sched["beta_loc"])
-            targ_loc = soft_argmax3d(
-                target32, mask=focus_roi_tight, beta=sched["beta_loc"])
-            loss_loc = F.l1_loss(pred_loc, targ_loc)
-        else:
-            loss_loc = torch.zeros((), device=pred.device, dtype=torch.float32)
-
-        total = (
-            self.lambda_global * loss_global
-            + self.lambda_focus * loss_focus
-            + self.lambda_grad * loss_grad
-            + sched["lambda_peak_eff"] * loss_peak
-            + sched["lambda_loc_eff"] * loss_loc
-        )
-
-        if return_dict:
-            comp = {
-                "loss_total": float(total.detach().item()),
-                "loss_global": float(loss_global.detach().item()),
-                "loss_focus": float(loss_focus.detach().item()),
-                "loss_grad": float(loss_grad.detach().item()),
-                "loss_peak": float(loss_peak.detach().item()),
-                "loss_loc": float(loss_loc.detach().item()),
-                "r_peak": float(sched["r_peak"]),
-                "r_loc": float(sched["r_loc"]),
-                "beta_peak": float(sched["beta_peak"]),
-                "beta_loc": float(sched["beta_loc"]),
-                "lambda_peak_eff": float(sched["lambda_peak_eff"]),
-                "lambda_loc_eff": float(sched["lambda_loc_eff"]),
-            }
-            return total, comp
-
-        return total
-
 
 # =========================================================
-# Discriminador 3D PatchGAN
+# MODELOS
 # =========================================================
-class PatchDiscriminator3D(nn.Module):
-    def __init__(self, in_ch=3, base=32):
+class ConvBlock3D(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, norm: bool = True):
         super().__init__()
+        layers = [
+            nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=not norm)
+        ]
+        if norm:
+            # GroupNorm suele ir bien en batch size peque�o
+            num_groups = 8 if out_ch >= 8 else 1
+            layers.append(nn.GroupNorm(num_groups=num_groups, num_channels=out_ch))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        self.block = nn.Sequential(*layers)
 
-        def block(cin, cout, k=4, s=2, p=1, norm=True):
-            layers = [nn.Conv3d(cin, cout, kernel_size=k, stride=s, padding=p)]
-            if norm:
-                layers.append(nn.InstanceNorm3d(cout, affine=True))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-            return nn.Sequential(*layers)
+    def forward(self, x):
+        return self.block(x)
+
+
+class ResidualBlock3D(nn.Module):
+    def __init__(self, ch: int):
+        super().__init__()
+        num_groups = 8 if ch >= 8 else 1
+        self.conv1 = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
+        self.gn1 = nn.GroupNorm(num_groups=num_groups, num_channels=ch)
+        self.conv2 = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
+        self.gn2 = nn.GroupNorm(num_groups=num_groups, num_channels=ch)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x):
+        r = x
+        x = self.act(self.gn1(self.conv1(x)))
+        x = self.gn2(self.conv2(x))
+        x = self.act(x + r)
+        return x
+
+
+class DownBlock3D(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            ConvBlock3D(in_ch, out_ch, stride=2, norm=True),
+            ConvBlock3D(out_ch, out_ch, stride=1, norm=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UpBlock3D(nn.Module):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1 = ConvBlock3D(in_ch + skip_ch, out_ch, stride=1, norm=True)
+        self.conv2 = ConvBlock3D(out_ch, out_ch, stride=1, norm=True)
+
+    def forward(self, x, skip):
+        x = F.interpolate(x, size=skip.shape[-3:], mode="trilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+
+class ResidualRefiner3D(nn.Module):
+    """
+    Entrada: concat([X, y_base]) -> 3 canales si X tiene 2
+    Salida: delta en [-1,1] v�a tanh
+    """
+    def __init__(self, x_ch: int = 2):
+        super().__init__()
+        in_ch = x_ch + 1  # X + y_base
+
+        self.enc1 = nn.Sequential(
+            ConvBlock3D(in_ch, 16, stride=1, norm=True),
+            ConvBlock3D(16, 16, stride=1, norm=True),
+        )
+        self.down1 = DownBlock3D(16, 32)
+        self.down2 = DownBlock3D(32, 64)
+
+        self.bottleneck = nn.Sequential(
+            ResidualBlock3D(64),
+            ResidualBlock3D(64),
+        )
+
+        self.up1 = UpBlock3D(64, 32, 32)
+        self.up2 = UpBlock3D(32, 16, 16)
+
+        self.out_conv = nn.Conv3d(16, 1, kernel_size=1)
+
+    def forward(self, x, y_base):
+        z = torch.cat([x, y_base], dim=1)
+
+        s1 = self.enc1(z)      # 16, 128
+        s2 = self.down1(s1)    # 32, 64
+        s3 = self.down2(s2)    # 64, 32
+
+        b = self.bottleneck(s3)
+
+        u1 = self.up1(b, s2)
+        u2 = self.up2(u1, s1)
+
+        delta = torch.tanh(self.out_conv(u2))
+        return delta
+
+
+class PatchDiscriminator3D(nn.Module):
+    """
+    Discriminador condicional:
+    entrada = concat([X, y])  -> 3 canales si X tiene 2 y y tiene 1
+    salida = mapa de patches
+    """
+    def __init__(self, x_ch: int = 2):
+        super().__init__()
+        in_ch = x_ch + 1
 
         self.net = nn.Sequential(
-            block(in_ch, base, norm=False),
-            block(base, base * 2),
-            block(base * 2, base * 4),
-            block(base * 4, base * 8, s=1),
-            nn.Conv3d(base * 8, 1, kernel_size=4, stride=1, padding=1)
+            nn.Conv3d(in_ch, 16, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv3d(16, 32, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm3d(32, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv3d(32, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm3d(64, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv3d(64, 1, kernel_size=4, stride=1, padding=1),
         )
 
     def forward(self, x, y):
-        inp = torch.cat([x, y], dim=1)
-        return self.net(inp)
+        z = torch.cat([x, y], dim=1)
+        return self.net(z)
 
 
-def d_loss_lsgan(d_real, d_fake):
-    loss_real = torch.mean((d_real - 1.0) ** 2)
-    loss_fake = torch.mean((d_fake - 0.0) ** 2)
+# =========================================================
+# CARGA DEL UNET BASE
+# =========================================================
+def load_base_unet(ckpt_path: str, device: str):
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    model = ResUNet3D_HQ(
+        in_ch=2,
+        out_ch=1,
+        base=16,
+        norm_kind="group",
+        use_se=True,
+        out_positive=True,
+    ).to(device)
+
+    model.load_state_dict(ckpt["model"], strict=True)
+    model.eval()
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    return model, ckpt
+
+
+# =========================================================
+# P�RDIDAS GAN
+# =========================================================
+def discriminator_lsgan_loss(d_real: torch.Tensor, d_fake: torch.Tensor) -> torch.Tensor:
+    # real -> 1 ; fake -> 0
+    loss_real = ((d_real - 1.0) ** 2).mean()
+    loss_fake = (d_fake ** 2).mean()
     return 0.5 * (loss_real + loss_fake)
 
 
-def g_loss_lsgan(d_fake):
-    return torch.mean((d_fake - 1.0) ** 2)
+def generator_adv_lsgan_loss(d_fake_for_g: torch.Tensor) -> torch.Tensor:
+    return ((d_fake_for_g - 1.0) ** 2).mean()
+
+
+def build_fake_output(y_base: torch.Tensor, delta: torch.Tensor, alpha_resid: float) -> torch.Tensor:
+    y_fake = y_base + alpha_resid * delta
+    y_fake = y_fake.clamp_min(0.0)
+    return y_fake
+
+
+def compute_generator_losses(
+    D: nn.Module,
+    X: torch.Tensor,
+    y_gt: torch.Tensor,
+    y_base: torch.Tensor,
+    brain_mask: torch.Tensor,
+    refiner: nn.Module,
+    alpha_resid: float,
+    lambda_adv_current: float,
+):
+    delta = refiner(X, y_base)
+    y_fake = build_fake_output(y_base, delta, alpha_resid)
+
+    loss_l1_global = F.l1_loss(y_fake, y_gt)
+    loss_l1_brain = masked_l1_loss(y_fake, y_gt, brain_mask)
+    loss_peak = peak_value_loss(y_fake, y_gt, brain_mask)
+    loss_loc = location_loss_softargmax(y_fake, y_gt, brain_mask, beta=SOFTARGMAX_BETA)
+
+    d_fake_for_g = D(X, y_fake)
+    loss_adv = generator_adv_lsgan_loss(d_fake_for_g)
+
+    loss_g = (
+        LAMBDA_BRAIN * loss_l1_brain +
+        LAMBDA_GLOBAL * loss_l1_global +
+        LAMBDA_PEAK * loss_peak +
+        LAMBDA_LOC * loss_loc +
+        lambda_adv_current * loss_adv
+    )
+
+    loss_dict = {
+        "loss_g_total": loss_g,
+        "loss_l1_global": loss_l1_global,
+        "loss_l1_brain": loss_l1_brain,
+        "loss_peak": loss_peak,
+        "loss_loc": loss_loc,
+        "loss_adv": loss_adv,
+        "y_fake": y_fake,
+    }
+    return loss_dict
 
 
 # =========================================================
-# Visual Callback
+# M�TRICAS DE VALIDACI�N
 # =========================================================
-class VisualCallback:
-    def __init__(
-        self,
-        save_dir,
-        val_dataset,
-        device,
-        every_n_epochs=10,
-        fixed_indices=(0, 5, 10),
-        use_amp=True,
-        save_raw_npz=False,
-    ):
-        self.device = device
-        self.every_n_epochs = int(every_n_epochs)
-        self.use_amp = bool(use_amp)
-        self.save_raw_npz = bool(save_raw_npz)
+def compute_metrics_one_sample(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    brain_mask: np.ndarray,
+    dx_mm: float,
+    is_water_only: bool,
+) -> Dict[str, float]:
 
-        self.out_dir = os.path.join(save_dir, "visuals")
-        os.makedirs(self.out_dir, exist_ok=True)
+    pred = np.clip(pred.astype(np.float32), 0.0, None)
+    gt = gt.astype(np.float32)
+    brain_mask = (brain_mask > 0.5)
 
-        n_val = len(val_dataset)
-        valid_indices = [idx for idx in fixed_indices if 0 <= idx < n_val]
-        if len(valid_indices) == 0:
-            valid_indices = list(range(min(3, n_val)))
+    mse_global = float(np.mean((pred - gt) ** 2))
+    mae_global = float(np.mean(np.abs(pred - gt)))
+    ssim_global = compute_ssim_safe(pred, gt, data_range=1.0)
 
-        self.samples = []
-        for idx in valid_indices:
-            x, y = val_dataset[idx]
-            if not torch.is_tensor(x):
-                x = torch.from_numpy(x)
-            if not torch.is_tensor(y):
-                y = torch.from_numpy(y)
-            self.samples.append((int(idx), x.clone().cpu(), y.clone().cpu()))
+    out = {
+        "mse_global": mse_global,
+        "mae_global": mae_global,
+        "ssim_global": ssim_global,
+        "is_water_only": int(is_water_only),
+    }
 
-        print(
-            f"🖼️ VisualCallback activo con casos fijos: {[s[0] for s in self.samples]}")
+    if is_water_only or brain_mask.sum() == 0:
+        out.update({
+            "mse_brain": float("nan"),
+            "mae_brain": float("nan"),
+            "ssim_brain": float("nan"),
+            "peak_abs_err_brain": float("nan"),
+            "peak_rel_err_brain": float("nan"),
+            "peak_loc_err_vox_brain": float("nan"),
+            "peak_loc_err_mm_brain": float("nan"),
+            "dice_focus_brain_thr50": float("nan"),
+        })
+        return out
 
-    def should_run(self, epoch: int) -> bool:
-        return self.every_n_epochs > 0 and epoch % self.every_n_epochs == 0
+    pred_brain_vals = pred[brain_mask]
+    gt_brain_vals = gt[brain_mask]
 
-    @staticmethod
-    def _to_numpy_3d(t: torch.Tensor):
-        return t.detach().float().cpu().squeeze().numpy()
+    mse_brain = float(np.mean((pred_brain_vals - gt_brain_vals) ** 2))
+    mae_brain = float(np.mean(np.abs(pred_brain_vals - gt_brain_vals)))
 
-    @staticmethod
-    def _norm_2d(a: np.ndarray):
-        a = a.astype(np.float32)
-        mn, mx = float(a.min()), float(a.max())
-        if mx - mn < 1e-8:
-            return np.zeros_like(a, dtype=np.float32)
-        return (a - mn) / (mx - mn + 1e-8)
+    pred_brain_vol = pred * brain_mask.astype(np.float32)
+    gt_brain_vol = gt * brain_mask.astype(np.float32)
 
-    @classmethod
-    def _make_overlay(cls, gt2d: np.ndarray, pred2d: np.ndarray):
-        g = cls._norm_2d(gt2d)
-        p = cls._norm_2d(pred2d)
-        rgb = np.stack([p, g, np.zeros_like(g)], axis=-1)
-        return np.clip(rgb, 0.0, 1.0)
+    pred_brain_crop = crop_to_mask_bbox(pred_brain_vol, brain_mask)
+    gt_brain_crop = crop_to_mask_bbox(gt_brain_vol, brain_mask)
+    ssim_brain = compute_ssim_safe(pred_brain_crop, gt_brain_crop, data_range=1.0)
 
-    @staticmethod
-    def _peak_idx(vol: np.ndarray):
-        return np.unravel_index(np.argmax(vol), vol.shape)
+    gt_peak_idx = get_peak_index_masked(gt, brain_mask)
+    pred_peak_idx = get_peak_index_masked(pred, brain_mask)
 
-    def _save_case_figure(self, pred: np.ndarray, gt: np.ndarray, epoch: int, case_idx: int):
-        pred = np.clip(pred, 0.0, None)
-        err = np.abs(pred - gt)
+    gt_peak_val_brain = float(gt[gt_peak_idx])
+    pred_peak_val_brain = float(pred[pred_peak_idx])
 
-        z_gt, y_gt, x_gt = self._peak_idx(gt)
-        z_pr, y_pr, x_pr = self._peak_idx(pred)
+    peak_abs_err_brain = abs(pred_peak_val_brain - gt_peak_val_brain)
+    peak_rel_err_brain = peak_abs_err_brain / (abs(gt_peak_val_brain) + 1e-8)
 
-        peak_err_vox = np.sqrt((z_pr - z_gt) ** 2 +
-                               (y_pr - y_gt) ** 2 + (x_pr - x_gt) ** 2)
+    peak_loc_err_vox_brain = math.sqrt(
+        (pred_peak_idx[0] - gt_peak_idx[0]) ** 2 +
+        (pred_peak_idx[1] - gt_peak_idx[1]) ** 2 +
+        (pred_peak_idx[2] - gt_peak_idx[2]) ** 2
+    )
+    peak_loc_err_mm_brain = peak_loc_err_vox_brain * dx_mm
 
-        gt_ax = gt[z_gt, :, :]
-        pr_ax = pred[z_gt, :, :]
-        er_ax = err[z_gt, :, :]
+    gt_thr50 = 0.50 * gt_peak_val_brain
+    pr_thr50 = 0.50 * pred_peak_val_brain
 
-        gt_co = gt[:, y_gt, :]
-        pr_co = pred[:, y_gt, :]
-        er_co = err[:, y_gt, :]
+    gt_focus_thr50 = np.logical_and(gt >= gt_thr50, brain_mask)
+    pr_focus_thr50 = np.logical_and(pred >= pr_thr50, brain_mask)
 
-        gt_sa = gt[:, :, x_gt]
-        pr_sa = pred[:, :, x_gt]
-        er_sa = err[:, :, x_gt]
+    dice_focus_brain_thr50 = dice_score(gt_focus_thr50, pr_focus_thr50)
 
-        fig, axes = plt.subplots(3, 4, figsize=(16, 12))
-        rows = [("Axial", gt_ax, pr_ax, er_ax), ("Coronal", gt_co,
-                                                 pr_co, er_co), ("Sagittal", gt_sa, pr_sa, er_sa)]
+    out.update({
+        "mse_brain": mse_brain,
+        "mae_brain": mae_brain,
+        "ssim_brain": ssim_brain,
+        "peak_abs_err_brain": peak_abs_err_brain,
+        "peak_rel_err_brain": peak_rel_err_brain,
+        "peak_loc_err_vox_brain": float(peak_loc_err_vox_brain),
+        "peak_loc_err_mm_brain": float(peak_loc_err_mm_brain),
+        "dice_focus_brain_thr50": dice_focus_brain_thr50,
+    })
 
-        vmax_main = max(float(gt.max()), float(pred.max()), 1e-8)
-        vmax_err = max(float(err.max()), 1e-8)
+    return out
 
-        for r, (name, g, p, e) in enumerate(rows):
-            axes[r, 0].imshow(g, cmap="jet", origin="lower",
-                              vmin=0, vmax=vmax_main)
-            axes[r, 0].set_title(f"{name} | GT")
-            axes[r, 0].axis("off")
 
-            axes[r, 1].imshow(p, cmap="jet", origin="lower",
-                              vmin=0, vmax=vmax_main)
-            axes[r, 1].set_title(f"{name} | Pred")
-            axes[r, 1].axis("off")
+def summarize_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
+    keys_num = [
+        "mse_global",
+        "mae_global",
+        "ssim_global",
+        "mse_brain",
+        "mae_brain",
+        "ssim_brain",
+        "peak_abs_err_brain",
+        "peak_rel_err_brain",
+        "peak_loc_err_vox_brain",
+        "peak_loc_err_mm_brain",
+        "dice_focus_brain_thr50",
+    ]
 
-            axes[r, 2].imshow(e, cmap="magma", origin="lower",
-                              vmin=0, vmax=vmax_err)
-            axes[r, 2].set_title(f"{name} | |Error|")
-            axes[r, 2].axis("off")
+    n_samples = len(rows)
+    n_water_only = int(sum(int(r["is_water_only"]) for r in rows))
+    n_non_water_only = int(n_samples - n_water_only)
 
-            overlay = self._make_overlay(g, p)
-            axes[r, 3].imshow(overlay, origin="lower")
-            axes[r, 3].set_title(f"{name} | Overlay")
-            axes[r, 3].axis("off")
+    out = {
+        "n_samples": n_samples,
+        "n_water_only": n_water_only,
+        "n_non_water_only": n_non_water_only,
+    }
 
-        gt_peak = float(gt.max())
-        pr_peak = float(pred.max())
-        peak_rel_err = abs(pr_peak - gt_peak) / (abs(gt_peak) + 1e-8)
+    for k in keys_num:
+        vals = np.array([r[k] for r in rows], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
 
-        fig.suptitle(
-            f"Epoch {epoch:03d} | Case {case_idx} | "
-            f"GT peak idx=({z_gt},{y_gt},{x_gt}) | Pred peak idx=({z_pr},{y_pr},{x_pr}) | "
-            f"PeakErr={peak_err_vox:.2f} vox | PeakRelErr={peak_rel_err:.4f}",
-            fontsize=12
+        if len(vals) == 0:
+            out[f"mean_{k}"] = float("nan")
+            out[f"std_{k}"] = float("nan")
+        else:
+            out[f"mean_{k}"] = float(np.mean(vals))
+            out[f"std_{k}"] = float(np.std(vals))
+
+    return out
+
+
+def model_selection_score(summary: Dict[str, float]) -> float:
+    """
+    Menor es mejor.
+    Priorizamos no da�ar:
+      1) peak loc
+      2) peak rel
+      3) MAE brain
+    y bonificamos algo dice/ssim.
+    """
+    def safe(key: str, default: float):
+        v = summary.get(key, float("nan"))
+        return default if not np.isfinite(v) else float(v)
+
+    peak_loc = safe("mean_peak_loc_err_mm_brain", 1e6)
+    peak_rel = safe("mean_peak_rel_err_brain", 1e6)
+    mae_brain = safe("mean_mae_brain", 1e6)
+    dice50 = safe("mean_dice_focus_brain_thr50", 0.0)
+    ssim_brain = safe("mean_ssim_brain", 0.0)
+
+    score = (
+        0.45 * peak_loc +
+        0.25 * peak_rel +
+        0.20 * mae_brain -
+        0.05 * dice50 -
+        0.05 * ssim_brain
+    )
+    return float(score)
+
+
+# =========================================================
+# TRAIN / VAL
+# =========================================================
+def train_one_epoch(
+    epoch: int,
+    base_model: nn.Module,
+    refiner: nn.Module,
+    D: nn.Module,
+    loader: DataLoader,
+    opt_g: torch.optim.Optimizer,
+    opt_d: torch.optim.Optimizer,
+):
+    refiner.train()
+    D.train()
+
+    lambda_adv_current = 0.0 if epoch <= ADV_WARMUP_EPOCHS else LAMBDA_ADV
+
+    accum = {
+        "loss_d": 0.0,
+        "loss_g_total": 0.0,
+        "loss_l1_global": 0.0,
+        "loss_l1_brain": 0.0,
+        "loss_peak": 0.0,
+        "loss_loc": 0.0,
+        "loss_adv": 0.0,
+    }
+
+    n_batches = 0
+    t0 = time.time()
+
+    for batch in loader:
+        X = batch["X"].to(DEVICE, non_blocking=True)
+        y = batch["y"].to(DEVICE, non_blocking=True)
+        brain = batch["brain_mask"].to(DEVICE, non_blocking=True)
+
+        with torch.no_grad():
+            y_base = base_model(X).clamp_min(0.0)
+
+        # -------------------------
+        # 1) Update D
+        # -------------------------
+        opt_d.zero_grad(set_to_none=True)
+
+        delta_det = refiner(X, y_base)
+        y_fake_det = build_fake_output(y_base, delta_det, ALPHA_RESID)
+
+        d_real = D(X, y)
+        d_fake = D(X, y_fake_det.detach())
+        loss_d = discriminator_lsgan_loss(d_real, d_fake)
+
+        loss_d.backward()
+        if GRAD_CLIP is not None and GRAD_CLIP > 0:
+            torch.nn.utils.clip_grad_norm_(D.parameters(), GRAD_CLIP)
+        opt_d.step()
+
+        # -------------------------
+        # 2) Update G
+        # -------------------------
+        opt_g.zero_grad(set_to_none=True)
+
+        g_losses = compute_generator_losses(
+            D=D,
+            X=X,
+            y_gt=y,
+            y_base=y_base,
+            brain_mask=brain,
+            refiner=refiner,
+            alpha_resid=ALPHA_RESID,
+            lambda_adv_current=lambda_adv_current,
         )
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        loss_g = g_losses["loss_g_total"]
 
-        out_png = os.path.join(
-            self.out_dir, f"epoch_{epoch:03d}_case_{case_idx:03d}.png")
-        fig.savefig(out_png, dpi=160, bbox_inches="tight")
-        plt.close(fig)
+        loss_g.backward()
+        if GRAD_CLIP is not None and GRAD_CLIP > 0:
+            torch.nn.utils.clip_grad_norm_(refiner.parameters(), GRAD_CLIP)
+        opt_g.step()
 
-        if self.save_raw_npz:
-            out_npz = os.path.join(
-                self.out_dir, f"epoch_{epoch:03d}_case_{case_idx:03d}.npz")
-            np.savez_compressed(
-                out_npz,
-                pred=pred.astype(np.float32),
-                gt=gt.astype(np.float32),
-                peak_gt=np.array([z_gt, y_gt, x_gt], dtype=np.int32),
-                peak_pred=np.array([z_pr, y_pr, x_pr], dtype=np.int32),
-                peak_err_vox=np.array([peak_err_vox], dtype=np.float32),
-                peak_rel_err=np.array([peak_rel_err], dtype=np.float32),
-            )
+        accum["loss_d"] += float(loss_d.item())
+        accum["loss_g_total"] += float(g_losses["loss_g_total"].item())
+        accum["loss_l1_global"] += float(g_losses["loss_l1_global"].item())
+        accum["loss_l1_brain"] += float(g_losses["loss_l1_brain"].item())
+        accum["loss_peak"] += float(g_losses["loss_peak"].item())
+        accum["loss_loc"] += float(g_losses["loss_loc"].item())
+        accum["loss_adv"] += float(g_losses["loss_adv"].item())
 
-    @torch.no_grad()
-    def __call__(self, G, epoch: int):
-        if not self.should_run(epoch):
-            return
+        n_batches += 1
 
-        was_training = G.training
-        G.eval()
+    for k in accum:
+        accum[k] /= max(n_batches, 1)
 
-        amp_ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.float16)
-            if (self.use_amp and self.device == "cuda")
-            else nullcontext()
+    accum["time_sec"] = time.time() - t0
+    accum["lambda_adv_current"] = lambda_adv_current
+    return accum
+
+
+@torch.no_grad()
+def validate_one_epoch(
+    epoch: int,
+    base_model: nn.Module,
+    refiner: nn.Module,
+    D: nn.Module,
+    loader: DataLoader,
+):
+    refiner.eval()
+    D.eval()
+
+    lambda_adv_current = 0.0 if epoch <= ADV_WARMUP_EPOCHS else LAMBDA_ADV
+
+    accum = {
+        "val_loss_g_total": 0.0,
+        "val_loss_l1_global": 0.0,
+        "val_loss_l1_brain": 0.0,
+        "val_loss_peak": 0.0,
+        "val_loss_loc": 0.0,
+        "val_loss_adv": 0.0,
+    }
+
+    rows = []
+    n_batches = 0
+
+    for batch in loader:
+        X = batch["X"].to(DEVICE, non_blocking=True)
+        y = batch["y"].to(DEVICE, non_blocking=True)
+        brain = batch["brain_mask"].to(DEVICE, non_blocking=True)
+        is_water_only = bool(batch["is_water_only"][0])
+        file_name = batch["file_name"][0]
+
+        y_base = base_model(X).clamp_min(0.0)
+
+        g_losses = compute_generator_losses(
+            D=D,
+            X=X,
+            y_gt=y,
+            y_base=y_base,
+            brain_mask=brain,
+            refiner=refiner,
+            alpha_resid=ALPHA_RESID,
+            lambda_adv_current=lambda_adv_current,
         )
 
-        print(
-            f"🖼️ Guardando visualizaciones de validación en epoch {epoch:03d}...")
+        y_fake = g_losses["y_fake"]
 
-        for case_idx, x_cpu, y_cpu in self.samples:
-            X = x_cpu.unsqueeze(0).to(self.device, non_blocking=True)
-            with amp_ctx:
-                pred = G(X)
+        accum["val_loss_g_total"] += float(g_losses["loss_g_total"].item())
+        accum["val_loss_l1_global"] += float(g_losses["loss_l1_global"].item())
+        accum["val_loss_l1_brain"] += float(g_losses["loss_l1_brain"].item())
+        accum["val_loss_peak"] += float(g_losses["loss_peak"].item())
+        accum["val_loss_loc"] += float(g_losses["loss_loc"].item())
+        accum["val_loss_adv"] += float(g_losses["loss_adv"].item())
+        n_batches += 1
 
-            pred_np = self._to_numpy_3d(pred.clamp_min(0.0))
-            gt_np = self._to_numpy_3d(y_cpu)
+        pred_np = y_fake[0, 0].detach().cpu().numpy()
+        gt_np = y[0, 0].detach().cpu().numpy()
+        brain_np = brain[0, 0].detach().cpu().numpy()
 
-            self._save_case_figure(pred_np, gt_np, epoch, case_idx)
+        metrics = compute_metrics_one_sample(
+            pred=pred_np,
+            gt=gt_np,
+            brain_mask=brain_np,
+            dx_mm=DX_MM,
+            is_water_only=is_water_only,
+        )
+        metrics["file"] = file_name
+        rows.append(metrics)
 
-        if was_training:
-            G.train()
+    for k in accum:
+        accum[k] /= max(n_batches, 1)
+
+    summary = summarize_metrics(rows)
+    sel_score = model_selection_score(summary)
+
+    accum.update(summary)
+    accum["selection_score"] = sel_score
+    return accum, rows
 
 
 # =========================================================
-# Checkpointing
+# CHECKPOINTS / LOGS
 # =========================================================
-def save_ckpt(path, model, optimizer, scaler, epoch, best_val, config):
+def save_checkpoint(
+    path: str,
+    epoch: int,
+    refiner: nn.Module,
+    D: nn.Module,
+    opt_g: torch.optim.Optimizer,
+    opt_d: torch.optim.Optimizer,
+    base_ckpt_path: str,
+    train_stats: Dict[str, float],
+    val_stats: Dict[str, float],
+):
     ckpt = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict() if optimizer is not None else None,
-        "scaler": scaler.state_dict() if scaler is not None else None,
-        "epoch": int(epoch),
-        "best_val": float(best_val),
-        "config": config,
+        "epoch": epoch,
+        "refiner": refiner.state_dict(),
+        "discriminator": D.state_dict(),
+        "optimizer_g": opt_g.state_dict(),
+        "optimizer_d": opt_d.state_dict(),
+        "base_ckpt_path": base_ckpt_path,
+        "alpha_resid": ALPHA_RESID,
+        "config": {
+            "LAMBDA_BRAIN": LAMBDA_BRAIN,
+            "LAMBDA_GLOBAL": LAMBDA_GLOBAL,
+            "LAMBDA_PEAK": LAMBDA_PEAK,
+            "LAMBDA_LOC": LAMBDA_LOC,
+            "LAMBDA_ADV": LAMBDA_ADV,
+            "ADV_WARMUP_EPOCHS": ADV_WARMUP_EPOCHS,
+            "SOFTARGMAX_BETA": SOFTARGMAX_BETA,
+            "DX_MM": DX_MM,
+            "BATCH_SIZE": BATCH_SIZE,
+            "LR_G": LR_G,
+            "LR_D": LR_D,
+        },
+        "train_stats": train_stats,
+        "val_stats": val_stats,
     }
     torch.save(ckpt, path)
 
 
-def load_ckpt(path, model, optimizer=None, scaler=None, device="cpu"):
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"], strict=True)
-
-    if optimizer is not None and ckpt.get("optimizer") is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
-
-    epoch = int(ckpt.get("epoch", 0))
-    best_val = float(ckpt.get("best_val", float("inf")))
-    config = ckpt.get("config", None)
-    return epoch, best_val, config
-
-
-# =========================================================
-# CSV logging
-# =========================================================
-def init_csv(csv_path):
-    if not os.path.exists(csv_path):
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "epoch",
-                "train_g_total",
-                "train_g_phys",
-                "train_g_adv",
-                "train_d",
-                "val_g_phys",
-                "val_loss_global",
-                "val_loss_focus",
-                "val_loss_grad",
-                "val_loss_peak",
-                "val_loss_loc",
-                "lambda_adv",
-                "lr_g",
-                "lr_d",
-                "time_sec",
-            ])
-
-
-def append_csv(csv_path, epoch, tr_stats, val_phys, val_comp, lambda_adv, lr_g, lr_d, time_sec):
+def append_log_csv(csv_path: str, row: Dict[str, float]):
+    file_exists = os.path.exists(csv_path)
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            epoch,
-            f"{tr_stats['g_total']:.8f}",
-            f"{tr_stats['g_phys']:.8f}",
-            f"{tr_stats['g_adv']:.8f}",
-            f"{tr_stats['d_total']:.8f}",
-            f"{val_phys:.8f}",
-            f"{val_comp['loss_global']:.8f}",
-            f"{val_comp['loss_focus']:.8f}",
-            f"{val_comp['loss_grad']:.8f}",
-            f"{val_comp['loss_peak']:.8f}",
-            f"{val_comp['loss_loc']:.8f}",
-            f"{lambda_adv:.6f}",
-            f"{lr_g:.8e}",
-            f"{lr_d:.8e}",
-            f"{time_sec:.2f}",
-        ])
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
-# =========================================================
-# Schedules GAN
-# =========================================================
-def get_lambda_adv(epoch, adv_start_epoch=6, adv_full_epoch=20, adv_max=0.01):
-    alpha = ramp_linear(epoch, adv_start_epoch, adv_full_epoch)
-    return interp_linear(alpha, 0.0, adv_max)
-
-
-# =========================================================
-# Train / Val loops
-# =========================================================
-def train_one_epoch_cgan(
-    G, D, loader,
-    opt_G, opt_D,
-    scaler_G, scaler_D,
-    criterion_phys,
-    device,
-    epoch,
-    lambda_adv=0.01,
-    grad_clip_G=2.0,
-    grad_clip_D=2.0,
-    use_amp=True,
-    d_update_every=2,
-):
-    G.train()
-    D.train()
-
-    sums = {"g_total": 0.0, "g_phys": 0.0, "g_adv": 0.0, "d_total": 0.0}
-    n_batches = 0
-    n_d_updates = 0
-
-    for batch_idx, (X, y) in enumerate(loader, start=1):
-        X = X.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        amp_ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.float16)
-            if (use_amp and device == "cuda")
-            else nullcontext()
-        )
-
-        # =====================================================
-        # 1) Update D only if:
-        #    - adversarial branch is active
-        #    - this batch is scheduled for D update
-        # =====================================================
-        do_d_update = (lambda_adv > 0.0) and ((batch_idx % d_update_every) == 0)
-
-        if do_d_update:
-            opt_D.zero_grad(set_to_none=True)
-
-            with amp_ctx:
-                y_hat_detached = G(X).detach()
-                d_real = D(X, y)
-                d_fake = D(X, y_hat_detached)
-                loss_D = d_loss_lsgan(d_real, d_fake)
-
-            if torch.isfinite(loss_D):
-                if device == "cuda" and use_amp:
-                    scaler_D.scale(loss_D).backward()
-                    scaler_D.unscale_(opt_D)
-                    if grad_clip_D is not None and grad_clip_D > 0:
-                        torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=float(grad_clip_D))
-                    scaler_D.step(opt_D)
-                    scaler_D.update()
-                else:
-                    loss_D.backward()
-                    if grad_clip_D is not None and grad_clip_D > 0:
-                        torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=float(grad_clip_D))
-                    opt_D.step()
-
-                d_loss_value = float(loss_D.item())
-                n_d_updates += 1
-
-            else:
-                print(f"⚠️ Non-finite D loss en epoch {epoch}, batch {batch_idx}. Batch saltado.")
-                opt_D.zero_grad(set_to_none=True)
-                continue
-        else:
-            d_loss_value = 0.0
-
-        # =====================================================
-        # 2) Update G every batch
-        # =====================================================
-        opt_G.zero_grad(set_to_none=True)
-
-        with amp_ctx:
-            y_hat = G(X)
-            loss_phys = criterion_phys(y_hat, y, epoch=epoch)
-
-            if lambda_adv > 0.0:
-                d_fake_for_g = D(X, y_hat)
-                loss_adv = g_loss_lsgan(d_fake_for_g)
-            else:
-                loss_adv = torch.zeros((), device=device, dtype=torch.float32)
-
-            loss_G = loss_phys + lambda_adv * loss_adv
-
-        if torch.isfinite(loss_G):
-            if device == "cuda" and use_amp:
-                scaler_G.scale(loss_G).backward()
-                scaler_G.unscale_(opt_G)
-                if grad_clip_G is not None and grad_clip_G > 0:
-                    torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=float(grad_clip_G))
-                scaler_G.step(opt_G)
-                scaler_G.update()
-            else:
-                loss_G.backward()
-                if grad_clip_G is not None and grad_clip_G > 0:
-                    torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=float(grad_clip_G))
-                opt_G.step()
-        else:
-            print(f"⚠️ Non-finite G loss en epoch {epoch}, batch {batch_idx}. Batch saltado.")
-            opt_G.zero_grad(set_to_none=True)
-            continue
-
-        sums["g_total"] += float(loss_G.item())
-        sums["g_phys"] += float(loss_phys.item())
-        sums["g_adv"] += float(loss_adv.item())
-        sums["d_total"] += d_loss_value
-        n_batches += 1
-
-    if n_batches == 0:
-        return {k: float("inf") for k in sums.keys()}
-
-    out = {
-        "g_total": sums["g_total"] / max(1, n_batches),
-        "g_phys": sums["g_phys"] / max(1, n_batches),
-        "g_adv": sums["g_adv"] / max(1, n_batches),
-        # D se promedia solo sobre las veces que realmente se actualizó
-        "d_total": (sums["d_total"] / max(1, n_d_updates)) if n_d_updates > 0 else 0.0,
-    }
-    return out
-
-@torch.no_grad()
-def eval_generator(G, loader, criterion_phys, device, epoch, use_amp=True):
-    G.eval()
-
-    total = 0.0
-    n_batches = 0
-
-    comp_sums = {
-        "loss_global": 0.0,
-        "loss_focus": 0.0,
-        "loss_grad": 0.0,
-        "loss_peak": 0.0,
-        "loss_loc": 0.0,
-        "r_peak": 0.0,
-        "r_loc": 0.0,
-        "beta_peak": 0.0,
-        "beta_loc": 0.0,
-        "lambda_peak_eff": 0.0,
-        "lambda_loc_eff": 0.0,
-    }
-
-    for X, y in loader:
-        X = X.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if (
-            use_amp and device == "cuda") else nullcontext()
-        with amp_ctx:
-            y_hat = G(X)
-            loss, comp = criterion_phys(
-                y_hat, y, epoch=epoch, return_dict=True)
-
-        if not torch.isfinite(loss):
-            print(f"⚠️ Non-finite val G loss en epoch {epoch}. Batch saltado.")
-            continue
-
-        total += float(loss.item())
-        n_batches += 1
-        for k in comp_sums.keys():
-            comp_sums[k] += float(comp[k])
-
-    if n_batches == 0:
-        return float("inf"), {k: float("inf") for k in comp_sums.keys()}
-
-    avg_total = total / n_batches
-    avg_comp = {k: v / n_batches for k, v in comp_sums.items()}
-    return avg_total, avg_comp
+def save_val_per_sample_csv(csv_path: str, rows: List[Dict[str, float]]):
+    if len(rows) == 0:
+        return
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 # =========================================================
 # MAIN
 # =========================================================
 def main():
-    SEED = 123
-    seed_all(SEED)
+    set_seed(SEED)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Device:", device)
+    print("========================================")
+    print("Residual cGAN TUS training")
+    print("========================================")
+    print("DEVICE:", DEVICE)
+    print("TRAIN_DIR:", TRAIN_DIR)
+    print("VAL_DIR:", VAL_DIR)
+    print("BASE_CKPT_PATH:", BASE_CKPT_PATH)
+    print("OUT_DIR:", OUT_DIR)
+    print("ALPHA_RESID:", ALPHA_RESID)
+    print("ADV_WARMUP_EPOCHS:", ADV_WARMUP_EPOCHS)
+    print("========================================")
 
-    if device == "cuda":
-        torch.backends.cudnn.benchmark = True
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
-
-    # -------------------------
-    # CONFIG
-    # -------------------------
-    SAVE_DIR = "checkpoints_cgan_tus_v1"
-    os.makedirs(SAVE_DIR, exist_ok=True)
-
-    TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
-    VAL_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
-    TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
-
-    BATCH_SIZE = 1
-    NUM_WORKERS = 2
-    PIN_MEMORY = True
-
-    EPOCHS = 100
-
-    LR_G = 1e-4
-    LR_D = 1e-5
-    WEIGHT_DECAY_G = 1e-4
-    WEIGHT_DECAY_D = 0.0
-    D_UPDATE_EVERY = 2
-    BASE_G = 16
-    USE_SE = True
-    OUT_POSITIVE = True
-    BASE_D = 32
-
-    USE_SCHEDULER_G = True
-    PLATEAU_PATIENCE_G = 6
-    PLATEAU_FACTOR_G = 0.5
-
-    WARM_START_G = True
-    WARM_START_G_PATH = r"checkpoints_unet_V2/last.pth"
-
-    RESUME_CGAN = False
-    RESUME_G_PATH = os.path.join(SAVE_DIR, "last_G.pth")
-    RESUME_D_PATH = os.path.join(SAVE_DIR, "last_D.pth")
-
-    SAVE_EVERY_N_EPOCHS = 10
-    SPECIFIC_SAVE_EPOCHS = {70, 80, 90, 100}
-    CSV_PATH = os.path.join(SAVE_DIR, "training_log.csv")
-
-    VISUAL_EVERY_N_EPOCHS = 10
-    VISUAL_FIXED_INDICES = (0, 5, 10)
-    VISUAL_SAVE_RAW_NPZ = True
-
-    ADV_START_EPOCH = 10
-    ADV_FULL_EPOCH = 30
-    ADV_MAX = 0.001
-
-    # -------------------------
-    # DATA
-    # -------------------------
-    train_ds = TusDataset(TRAIN_DIR)
-    val_ds = TusDataset(VAL_DIR)
-    test_ds = TusDataset(TEST_DIR)
-
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+    train_ds = TusGanDataset(TRAIN_DIR, expected_shape=EXPECTED_SHAPE)
+    val_ds = TusGanDataset(VAL_DIR, expected_shape=EXPECTED_SHAPE)
 
     train_loader = DataLoader(
         train_ds,
@@ -862,8 +927,6 @@ def main():
         shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=PIN_MEMORY,
-        persistent_workers=(NUM_WORKERS > 0),
-        prefetch_factor=2 if NUM_WORKERS > 0 else None
     )
 
     val_loader = DataLoader(
@@ -872,184 +935,125 @@ def main():
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=PIN_MEMORY,
-        persistent_workers=(NUM_WORKERS > 0),
-        prefetch_factor=2 if NUM_WORKERS > 0 else None
     )
 
-    # -------------------------
-    # MODELS
-    # -------------------------
-    G = ResUNet3D_HQ(
-        in_ch=2,
-        out_ch=1,
-        base=BASE_G,
-        norm_kind="group",
-        use_se=USE_SE,
-        out_positive=OUT_POSITIVE
-    ).to(device)
+    base_model, base_ckpt = load_base_unet(BASE_CKPT_PATH, DEVICE)
+    print(f"UNet base cargado desde epoch={int(base_ckpt.get('epoch', -1))}")
 
-    D = PatchDiscriminator3D(in_ch=3, base=BASE_D).to(device)
+    refiner = ResidualRefiner3D(x_ch=2).to(DEVICE)
+    D = PatchDiscriminator3D(x_ch=2).to(DEVICE)
 
-    opt_G = optim.AdamW(G.parameters(), lr=LR_G,
-                        weight_decay=WEIGHT_DECAY_G, betas=(0.5, 0.999))
-    opt_D = optim.AdamW(D.parameters(), lr=LR_D,
-                        weight_decay=WEIGHT_DECAY_D, betas=(0.5, 0.999))
+    opt_g = torch.optim.Adam(refiner.parameters(), lr=LR_G, betas=BETAS, weight_decay=WEIGHT_DECAY)
+    opt_d = torch.optim.Adam(D.parameters(), lr=LR_D, betas=BETAS, weight_decay=WEIGHT_DECAY)
 
-    try:
-        scaler_G = GradScaler("cuda", enabled=(device == "cuda"))
-        scaler_D = GradScaler("cuda", enabled=(device == "cuda"))
-    except TypeError:
-        scaler_G = GradScaler(enabled=(device == "cuda"))
-        scaler_D = GradScaler(enabled=(device == "cuda"))
+    best_score = float("inf")
+    log_csv = os.path.join(OUT_DIR, "training_log.csv")
 
-    criterion_phys = StableFocusAwareTUSLoss_ExpB()
+    for epoch in range(1, EPOCHS + 1):
+        print(f"\n===== Epoch {epoch:03d}/{EPOCHS:03d} =====")
 
-    visual_cb = VisualCallback(
-        save_dir=SAVE_DIR,
-        val_dataset=val_ds,
-        device=device,
-        every_n_epochs=VISUAL_EVERY_N_EPOCHS,
-        fixed_indices=VISUAL_FIXED_INDICES,
-        use_amp=True,
-        save_raw_npz=VISUAL_SAVE_RAW_NPZ,
-    )
-
-    scheduler_G = None
-    if USE_SCHEDULER_G:
-        try:
-            scheduler_G = optim.lr_scheduler.ReduceLROnPlateau(
-                opt_G, mode="min", factor=PLATEAU_FACTOR_G, patience=PLATEAU_PATIENCE_G, verbose=True
-            )
-        except TypeError:
-            scheduler_G = optim.lr_scheduler.ReduceLROnPlateau(
-                opt_G, mode="min", factor=PLATEAU_FACTOR_G, patience=PLATEAU_PATIENCE_G
-            )
-
-    # -------------------------
-    # Warm start / resume
-    # -------------------------
-    start_epoch = 0
-    best_val_g = float("inf")
-
-    if WARM_START_G and os.path.exists(WARM_START_G_PATH) and not RESUME_CGAN:
-        print(f"🔄 Warm-start G from: {WARM_START_G_PATH}")
-        ckpt = torch.load(WARM_START_G_PATH, map_location=device)
-        G.load_state_dict(ckpt["model"], strict=True)
-
-    if RESUME_CGAN:
-        if os.path.exists(RESUME_G_PATH):
-            start_epoch, best_val_g, _ = load_ckpt(
-                RESUME_G_PATH, G, opt_G, scaler_G, device=device)
-            print(
-                f"🔄 Resume G: epoch={start_epoch}, best_val_g={best_val_g:.6f}")
-        if os.path.exists(RESUME_D_PATH):
-            _, _, _ = load_ckpt(RESUME_D_PATH, D, opt_D,
-                                scaler_D, device=device)
-            print("🔄 Resume D loaded.")
-
-    config = {
-        "SEED": SEED,
-        "EPOCHS": EPOCHS,
-        "LR_G": LR_G,
-        "LR_D": LR_D,
-        "ADV_START_EPOCH": ADV_START_EPOCH,
-        "ADV_FULL_EPOCH": ADV_FULL_EPOCH,
-        "ADV_MAX": ADV_MAX,
-        "WARM_START_G": WARM_START_G,
-        "WARM_START_G_PATH": WARM_START_G_PATH,
-        "GENERATOR": "ResUNet3D_HQ",
-        "DISCRIMINATOR": "PatchDiscriminator3D",
-        "D_UPDATE_EVERY": D_UPDATE_EVERY,
-    }
-
-    with open(os.path.join(SAVE_DIR, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-
-    init_csv(CSV_PATH)
-
-    # -------------------------
-    # TRAIN
-    # -------------------------
-    for epoch in range(start_epoch + 1, EPOCHS + 1):
-        t0 = time.time()
-
-        lambda_adv = get_lambda_adv(
-            epoch,
-            adv_start_epoch=ADV_START_EPOCH,
-            adv_full_epoch=ADV_FULL_EPOCH,
-            adv_max=ADV_MAX
-        )
-
-        tr_stats = train_one_epoch_cgan(
-            G=G, D=D, loader=train_loader,
-            opt_G=opt_G, opt_D=opt_D,
-            scaler_G=scaler_G, scaler_D=scaler_D,
-            criterion_phys=criterion_phys,
-            device=device,
+        train_stats = train_one_epoch(
             epoch=epoch,
-            lambda_adv=lambda_adv,
-            grad_clip_G=2.0,
-            grad_clip_D=2.0,
-            use_amp=True,
-            d_update_every=D_UPDATE_EVERY,  
+            base_model=base_model,
+            refiner=refiner,
+            D=D,
+            loader=train_loader,
+            opt_g=opt_g,
+            opt_d=opt_d,
         )
 
-        val_g_phys, val_comp = eval_generator(
-            G=G, loader=val_loader, criterion_phys=criterion_phys,
-            device=device, epoch=epoch, use_amp=True
+        val_stats, val_rows = validate_one_epoch(
+            epoch=epoch,
+            base_model=base_model,
+            refiner=refiner,
+            D=D,
+            loader=val_loader,
         )
 
-        prev_lr_g = opt_G.param_groups[0]["lr"]
-        if scheduler_G is not None and np.isfinite(val_g_phys):
-            scheduler_G.step(val_g_phys)
-        new_lr_g = opt_G.param_groups[0]["lr"]
-        new_lr_d = opt_D.param_groups[0]["lr"]
+        log_row = {
+            "epoch": epoch,
+            "train_loss_d": train_stats["loss_d"],
+            "train_loss_g_total": train_stats["loss_g_total"],
+            "train_loss_l1_global": train_stats["loss_l1_global"],
+            "train_loss_l1_brain": train_stats["loss_l1_brain"],
+            "train_loss_peak": train_stats["loss_peak"],
+            "train_loss_loc": train_stats["loss_loc"],
+            "train_loss_adv": train_stats["loss_adv"],
+            "train_time_sec": train_stats["time_sec"],
+            "lambda_adv_current": train_stats["lambda_adv_current"],
 
-        dt = time.time() - t0
+            "val_loss_g_total": val_stats["val_loss_g_total"],
+            "val_loss_l1_global": val_stats["val_loss_l1_global"],
+            "val_loss_l1_brain": val_stats["val_loss_l1_brain"],
+            "val_loss_peak": val_stats["val_loss_peak"],
+            "val_loss_loc": val_stats["val_loss_loc"],
+            "val_loss_adv": val_stats["val_loss_adv"],
+
+            "mean_mae_global": val_stats["mean_mae_global"],
+            "mean_ssim_global": val_stats["mean_ssim_global"],
+            "mean_mae_brain": val_stats["mean_mae_brain"],
+            "mean_ssim_brain": val_stats["mean_ssim_brain"],
+            "mean_peak_rel_err_brain": val_stats["mean_peak_rel_err_brain"],
+            "mean_peak_loc_err_mm_brain": val_stats["mean_peak_loc_err_mm_brain"],
+            "mean_dice_focus_brain_thr50": val_stats["mean_dice_focus_brain_thr50"],
+            "selection_score": val_stats["selection_score"],
+        }
+        append_log_csv(log_csv, log_row)
 
         print(
-            f"Epoch {epoch:03d} | "
-            f"G_total={tr_stats['g_total']:.6f} | "
-            f"G_phys={tr_stats['g_phys']:.6f} | "
-            f"G_adv={tr_stats['g_adv']:.6f} | "
-            f"D={tr_stats['d_total']:.6f} | "
-            f"Val_phys={val_g_phys:.6f} | "
-            f"Peak={val_comp['loss_peak']:.4f} | "
-            f"Loc={val_comp['loss_loc']:.4f} | "
-            f"lambda_adv={lambda_adv:.4f} | "
-            f"lrG={new_lr_g:.2e} | lrD={new_lr_d:.2e} | "
-            f"time={dt:.1f}s"
+            f"Train | D={train_stats['loss_d']:.4f} | G={train_stats['loss_g_total']:.4f} | "
+            f"L1g={train_stats['loss_l1_global']:.4f} | L1brain={train_stats['loss_l1_brain']:.4f} | "
+            f"Peak={train_stats['loss_peak']:.4f} | Loc={train_stats['loss_loc']:.4f} | "
+            f"Adv={train_stats['loss_adv']:.4f} | t={train_stats['time_sec']:.1f}s"
         )
 
-        if new_lr_g < prev_lr_g:
-            print(f"🔻 LR_G reduced: {prev_lr_g:.2e} -> {new_lr_g:.2e}")
+        print(
+            f"Val   | G={val_stats['val_loss_g_total']:.4f} | "
+            f"MAEbrain={val_stats['mean_mae_brain']:.5f} | "
+            f"SSIMbrain={val_stats['mean_ssim_brain']:.5f} | "
+            f"PeakRel={val_stats['mean_peak_rel_err_brain']:.5f} | "
+            f"PeakLoc(mm)={val_stats['mean_peak_loc_err_mm_brain']:.5f} | "
+            f"Dice50={val_stats['mean_dice_focus_brain_thr50']:.5f} | "
+            f"Score={val_stats['selection_score']:.5f}"
+        )
 
-        append_csv(CSV_PATH, epoch, tr_stats, val_g_phys,
-                   val_comp, lambda_adv, new_lr_g, new_lr_d, dt)
+        # guardar per-sample val de esta �poca
+        val_per_sample_csv = os.path.join(OUT_DIR, f"val_epoch_{epoch:03d}_per_sample.csv")
+        save_val_per_sample_csv(val_per_sample_csv, val_rows)
 
-        save_ckpt(os.path.join(SAVE_DIR, "last_G.pth"), G,
-                  opt_G, scaler_G, epoch, best_val_g, config)
-        save_ckpt(os.path.join(SAVE_DIR, "last_D.pth"), D,
-                  opt_D, scaler_D, epoch, best_val_g, config)
+        # last
+        save_checkpoint(
+            path=os.path.join(OUT_DIR, "last_gan_refiner.pth"),
+            epoch=epoch,
+            refiner=refiner,
+            D=D,
+            opt_g=opt_g,
+            opt_d=opt_d,
+            base_ckpt_path=BASE_CKPT_PATH,
+            train_stats=train_stats,
+            val_stats=val_stats,
+        )
 
-        if val_g_phys < best_val_g:
-            best_val_g = val_g_phys
-            save_ckpt(os.path.join(SAVE_DIR, "best_G.pth"), G,
-                      opt_G, scaler_G, epoch, best_val_g, config)
-            save_ckpt(os.path.join(SAVE_DIR, "best_D_at_best_G.pth"),
-                      D, opt_D, scaler_D, epoch, best_val_g, config)
-            print(f"✅ New best G val phys: {best_val_g:.6f}")
+        # best
+        if val_stats["selection_score"] < best_score:
+            best_score = val_stats["selection_score"]
+            save_checkpoint(
+                path=os.path.join(OUT_DIR, "best_gan_refiner.pth"),
+                epoch=epoch,
+                refiner=refiner,
+                D=D,
+                opt_g=opt_g,
+                opt_d=opt_d,
+                base_ckpt_path=BASE_CKPT_PATH,
+                train_stats=train_stats,
+                val_stats=val_stats,
+            )
+            print(f" Nuevo mejor modelo | selection_score={best_score:.5f}")
 
-        if (epoch % SAVE_EVERY_N_EPOCHS == 0) or (epoch in SPECIFIC_SAVE_EPOCHS):
-            save_ckpt(os.path.join(
-                SAVE_DIR, f"epoch_{epoch:03d}_G.pth"), G, opt_G, scaler_G, epoch, best_val_g, config)
-            save_ckpt(os.path.join(
-                SAVE_DIR, f"epoch_{epoch:03d}_D.pth"), D, opt_D, scaler_D, epoch, best_val_g, config)
-            print(f"💾 Saved GAN checkpoints for epoch {epoch:03d}")
-
-        visual_cb(G, epoch)
-
-    print("✅ cGAN training done. Best generator val phys:", best_val_g)
+    print("\nEntrenamiento terminado.")
+    print("Best checkpoint:", os.path.join(OUT_DIR, "best_gan_refiner.pth"))
+    print("Last checkpoint:", os.path.join(OUT_DIR, "last_gan_refiner.pth"))
+    print("Log CSV:", log_csv)
 
 
 if __name__ == "__main__":

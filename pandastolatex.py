@@ -3,7 +3,7 @@ import glob
 import os
 
 # 1. Define the directory path once
-folder_path = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpC2/test_metrics_brain_expC"
+folder_path = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_refiner_expDexpB/test_metrics_brain"
 
 # 2. Get all summary files (excluding 'last' if you want)
 # This finds every file ending in _summary.csv
@@ -17,4 +17,4 @@ files.sort()
 
 # 4. Read and combine
 combined_df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-combined_df.to_csv('master_results_expDexpC2.csv', index=False)
+combined_df.to_csv('master_results_cGANexpDexpB.csv', index=False)
