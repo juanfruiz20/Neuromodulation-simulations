@@ -61,8 +61,8 @@ except ImportError:
 TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
 VAL_DIR   = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
 
-BASE_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/epoch_030.pth"
-OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze_expC1"
+BASE_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_ExpC/epoch_020.pth"
+OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expC"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -70,7 +70,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
 
 EXPECTED_SHAPE = (128, 128, 128)
-LOW_RES_SHAPE = (32, 32, 32)
+LOW_RES_SHAPE = (48, 48, 48)
 
 DX_MM = 1.0
 NUM_WORKERS = 0
@@ -229,7 +229,21 @@ def freeze_focus_loss(y_fake: torch.Tensor, y_base: torch.Tensor, freeze_roi: to
             vals.append(torch.abs(y_fake[b, 0][m] - y_base[b, 0][m]).mean())
     return torch.stack(vals).mean()
 
+def get_lambda_freeze(epoch: int) -> float:
+    if epoch <= 10:
+        return 8.0
+    elif epoch <= 20:
+        return 6.0
+    else:
+        return 4.0
 
+def get_freeze_radius(epoch: int) -> int:
+    if epoch <= 10:
+        return 5
+    elif epoch <= 20:
+        return 4
+    else:
+        return 4
 # =========================================================
 # DATASET
 # =========================================================
@@ -462,6 +476,7 @@ def compute_generator_losses(
     G: nn.Module,
     alpha_resid: float,
     lambda_adv_current: float,
+    lambda_freeze_current,
 ):
     x_low = downsample_to_lowres(X)
     y_base_low = downsample_to_lowres(y_base)
@@ -481,7 +496,7 @@ def compute_generator_losses(
     loss_g = (
         LAMBDA_GLOBAL * loss_l1_global +
         LAMBDA_BRAIN * loss_l1_brain +
-        LAMBDA_FREEZE * loss_freeze +
+        lambda_freeze_current * loss_freeze +
         lambda_adv_current * loss_adv
     )
 
@@ -659,6 +674,8 @@ def train_one_epoch(
     loader: DataLoader,
     opt_g: torch.optim.Optimizer,
     opt_d: torch.optim.Optimizer,
+    lambda_freeze_current: float,
+    freeze_radius_current: int,
 ):
     G.train()
     D.train()
@@ -685,7 +702,11 @@ def train_one_epoch(
         with torch.no_grad():
             y_base = base_model(X).clamp_min(0.0)
 
-        freeze_roi = make_freeze_focus_roi(y, brain, radius_vox=FREEZE_RADIUS_VOX)
+        freeze_roi = make_freeze_focus_roi(
+            y_gt=y,
+            brain_mask=brain,
+            radius_vox=freeze_radius_current,
+        )
 
         # -------------------------
         # 1) Update D
@@ -724,6 +745,7 @@ def train_one_epoch(
             G=G,
             alpha_resid=ALPHA_RESID,
             lambda_adv_current=lambda_adv_current,
+            lambda_freeze_current=lambda_freeze_current,
         )
 
         loss_g = g_losses["loss_g_total"]
@@ -748,6 +770,8 @@ def train_one_epoch(
 
     accum["time_sec"] = time.time() - t0
     accum["lambda_adv_current"] = lambda_adv_current
+    accum["lambda_freeze_current"] = lambda_freeze_current
+    accum["freeze_radius_current"] = freeze_radius_current
     return accum
 
 
@@ -758,6 +782,8 @@ def validate_one_epoch(
     G: nn.Module,
     D: nn.Module,
     loader: DataLoader,
+    lambda_freeze_current: float,
+    freeze_radius_current: int,
 ):
     G.eval()
     D.eval()
@@ -783,7 +809,12 @@ def validate_one_epoch(
         file_name = batch["file_name"][0]
 
         y_base = base_model(X).clamp_min(0.0)
-        freeze_roi = make_freeze_focus_roi(y, brain, radius_vox=FREEZE_RADIUS_VOX)
+
+        freeze_roi = make_freeze_focus_roi(
+            y_gt=y,
+            brain_mask=brain,
+            radius_vox=freeze_radius_current,
+        )
 
         g_losses = compute_generator_losses(
             D=D,
@@ -795,6 +826,7 @@ def validate_one_epoch(
             G=G,
             alpha_resid=ALPHA_RESID,
             lambda_adv_current=lambda_adv_current,
+            lambda_freeze_current=lambda_freeze_current,
         )
 
         y_fake = g_losses["y_fake"]
@@ -828,6 +860,8 @@ def validate_one_epoch(
 
     accum.update(summary)
     accum["selection_score"] = sel_score
+    accum["lambda_freeze_current"] = lambda_freeze_current
+    accum["freeze_radius_current"] = freeze_radius_current
     return accum, rows
 
 
@@ -844,6 +878,8 @@ def save_checkpoint(
     base_ckpt_path: str,
     train_stats: Dict[str, float],
     val_stats: Dict[str, float],
+    lambda_freeze_current: float,
+    freeze_radius_current: int,
 ):
     ckpt = {
         "epoch": epoch,
@@ -857,14 +893,18 @@ def save_checkpoint(
         "config": {
             "LAMBDA_GLOBAL": LAMBDA_GLOBAL,
             "LAMBDA_BRAIN": LAMBDA_BRAIN,
-            "LAMBDA_FREEZE": LAMBDA_FREEZE,
+            "LAMBDA_FREEZE_BASE": LAMBDA_FREEZE,
             "LAMBDA_ADV": LAMBDA_ADV,
             "ADV_WARMUP_EPOCHS": ADV_WARMUP_EPOCHS,
-            "FREEZE_RADIUS_VOX": FREEZE_RADIUS_VOX,
+            "FREEZE_RADIUS_VOX_BASE": FREEZE_RADIUS_VOX,
             "DX_MM": DX_MM,
             "BATCH_SIZE": BATCH_SIZE,
             "LR_G": LR_G,
             "LR_D": LR_D,
+        },
+        "current_epoch_settings": {
+            "lambda_freeze_current": lambda_freeze_current,
+            "freeze_radius_current": freeze_radius_current,
         },
         "train_stats": train_stats,
         "val_stats": val_stats,
@@ -943,6 +983,9 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         print(f"\n===== Epoch {epoch:03d}/{EPOCHS:03d} =====")
 
+        lambda_freeze_current = get_lambda_freeze(epoch)
+        freeze_radius_current = get_freeze_radius(epoch)
+
         train_stats = train_one_epoch(
             epoch=epoch,
             base_model=base_model,
@@ -951,6 +994,8 @@ def main():
             loader=train_loader,
             opt_g=opt_g,
             opt_d=opt_d,
+            lambda_freeze_current=lambda_freeze_current,
+            freeze_radius_current=freeze_radius_current,
         )
 
         val_stats, val_rows = validate_one_epoch(
@@ -959,6 +1004,8 @@ def main():
             G=G,
             D=D,
             loader=val_loader,
+            lambda_freeze_current=lambda_freeze_current,
+            freeze_radius_current=freeze_radius_current,
         )
 
         log_row = {
@@ -971,6 +1018,8 @@ def main():
             "train_loss_adv": train_stats["loss_adv"],
             "train_time_sec": train_stats["time_sec"],
             "lambda_adv_current": train_stats["lambda_adv_current"],
+            "lambda_freeze_current": train_stats["lambda_freeze_current"],
+            "freeze_radius_current": train_stats["freeze_radius_current"],
 
             "val_loss_g_total": val_stats["val_loss_g_total"],
             "val_loss_l1_global": val_stats["val_loss_l1_global"],
@@ -993,6 +1042,7 @@ def main():
             f"Train | D={train_stats['loss_d']:.4f} | G={train_stats['loss_g_total']:.4f} | "
             f"L1g={train_stats['loss_l1_global']:.4f} | L1brain={train_stats['loss_l1_brain']:.4f} | "
             f"Freeze={train_stats['loss_freeze']:.4f} | Adv={train_stats['loss_adv']:.4f} | "
+            f"freeze_lambda={lambda_freeze_current:.2f} | freeze_r={freeze_radius_current} | "
             f"t={train_stats['time_sec']:.1f}s"
         )
 
@@ -1019,6 +1069,8 @@ def main():
             base_ckpt_path=BASE_CKPT_PATH,
             train_stats=train_stats,
             val_stats=val_stats,
+            lambda_freeze_current=lambda_freeze_current,
+            freeze_radius_current=freeze_radius_current,
         )
 
         if val_stats["selection_score"] < best_score:
@@ -1033,6 +1085,8 @@ def main():
                 base_ckpt_path=BASE_CKPT_PATH,
                 train_stats=train_stats,
                 val_stats=val_stats,
+                lambda_freeze_current=lambda_freeze_current,
+                freeze_radius_current=freeze_radius_current,
             )
             print(f"Nuevo mejor modelo | selection_score={best_score:.5f}")
 
