@@ -35,7 +35,7 @@ except ImportError:
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
 
 # Carpeta de checkpoints del lowres freeze cGAN
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expDB"
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expDB_finetune"
 OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain_expDB")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
