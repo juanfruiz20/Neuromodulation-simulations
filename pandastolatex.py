@@ -3,7 +3,7 @@ import glob
 import os
 
 # 1. Define the directory path once
-folder_path = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expDB_finetune/test_metrics_brain_expDB"
+folder_path = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expC_finetune/test_metrics_brain_expDB"
 
 # 2. Get all summary files (excluding 'last' if you want)
 # This finds every file ending in _summary.csv

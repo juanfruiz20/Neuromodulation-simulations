@@ -41,10 +41,10 @@ VAL_DIR   = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simul
 BASE_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/epoch_030.pth"
 
 # Checkpoint desde el que quieres reanudar el cGAN freeze ya entrenado
-RESUME_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expDB/best_lowres_freeze_cgan.pth"
+RESUME_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expC/best_lowres_freeze_cgan.pth"
 
 # Carpeta nueva para el fine-tuning final
-OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expDB_finetune"
+OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_lowres_freeze2_expC_finetune"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -61,7 +61,7 @@ PIN_MEMORY = torch.cuda.is_available()
 BATCH_SIZE = 1
 
 # �pocas EXTRA de fine-tuning
-EPOCHS = 15
+EPOCHS = 30
 
 # LR m�s bajos para fine-tuning
 LR_G = 1e-4
