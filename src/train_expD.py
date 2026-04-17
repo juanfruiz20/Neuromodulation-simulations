@@ -14,10 +14,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from Data_loaderV2 import TusDataset
-from Unet3D_V2 import ResUNet3D_HQ
+from src.dataloader import TusDataset
+from src.modelos.ResUnet3D import ResUNet3D_HQ
 
-# --- AMP GradScaler compatible (PyTorch nuevo/viejo) ---
 try:
     from torch.amp import GradScaler
 except Exception:
@@ -35,14 +34,9 @@ def seed_all(seed: int = 123):
 
 
 # =========================================================
-# Helpers numéricos / geométricos
+# Helpers b�sicos
 # =========================================================
 def grad3d(x: torch.Tensor):
-    """
-    x: [B, 1, D, H, W]
-    Retorna (dx, dy, dz) con diferencias finitas y padding
-    al tamaño original.
-    """
     dx = x[:, :, 1:, :, :] - x[:, :, :-1, :, :]
     dy = x[:, :, :, 1:, :] - x[:, :, :, :-1, :]
     dz = x[:, :, :, :, 1:] - x[:, :, :, :, :-1]
@@ -58,9 +52,6 @@ def masked_mean(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6):
 
 
 def ramp_linear(epoch: int, start: int, end: int) -> float:
-    """
-    Rampa lineal 0->1 entre start y end.
-    """
     if epoch < start:
         return 0.0
     if epoch >= end:
@@ -73,110 +64,197 @@ def interp_linear(alpha: float, start_value: float, end_value: float) -> float:
     return (1.0 - alpha) * float(start_value) + alpha * float(end_value)
 
 
-def make_focus_roi(target: torch.Tensor,
-                   frac: float = 0.50,
-                   min_thr: float = 0.08,
-                   dilate_ks: int = 7):
-    """
-    ROI focal derivada del target.
-    - Umbral relativo al pico por muestra
-    - Dilatación para incluir vecindad del foco
-    """
+def make_focus_roi(target: torch.Tensor, frac: float, min_thr: float, dilate_ks: int):
     peak = target.amax(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6)
     thr = torch.maximum(peak * frac, torch.full_like(peak, min_thr))
     roi = (target >= thr).float()
 
     if dilate_ks is not None and dilate_ks > 1:
-        roi = F.max_pool3d(roi, kernel_size=dilate_ks,
-                           stride=1, padding=dilate_ks // 2)
+        roi = F.max_pool3d(
+            roi,
+            kernel_size=dilate_ks,
+            stride=1,
+            padding=dilate_ks // 2
+        )
         roi = (roi > 0).float()
 
     return roi, peak
 
 
-def make_peak_mask(target: torch.Tensor, frac: float = 0.85):
-    peak = target.amax(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6)
-    mask = (target >= peak * frac).float()
-    return mask, peak
-
-
-def approx_max(x: torch.Tensor, mask: torch.Tensor = None, beta: float = 20.0):
+# =========================================================
+# Helpers geom�tricos para tube ROI
+# =========================================================
+def get_gt_peak_indices(target: torch.Tensor):
     """
-    Aproximación diferenciable del máximo usando logsumexp estable.
-    Se calcula en float32.
+    target: [B,1,D,H,W]
+    retorna z_idx, y_idx, x_idx cada uno [B]
     """
-    x = x.float()
-    B, C, D, H, W = x.shape
-    flat = x.view(B, C, -1)
+    B, C, D, H, W = target.shape
+    flat = target.view(B, -1)
+    idx = flat.argmax(dim=1)
 
-    if mask is not None:
-        mask = mask.float().view(B, C, -1)
-        neg_val = torch.full_like(flat, -50.0)
-        flat = torch.where(mask > 0, flat, neg_val)
-
-    m = flat.max(dim=-1, keepdim=True).values
-    out = m + torch.logsumexp(beta * (flat - m), dim=-1, keepdim=True) / beta
-    return out  # [B, C, 1]
+    yz = H * W
+    z_idx = idx // yz
+    rem = idx % yz
+    y_idx = rem // W
+    x_idx = rem % W
+    return z_idx.long(), y_idx.long(), x_idx.long()
 
 
-def soft_argmax3d(x: torch.Tensor, mask: torch.Tensor = None, beta: float = 20.0):
+def get_source_center_from_mask(source_mask: torch.Tensor):
     """
-    Devuelve coordenadas normalizadas en [-1,1] del centro del máximo.
-    Se calcula en float32 para estabilidad.
-    x: [B, 1, D, H, W]
+    source_mask: [B,1,D,H,W]
+    devuelve centro de masa aproximado [B,3] en coords voxel (z,y,x)
     """
-    x = x.float()
-    B, C, D, H, W = x.shape
-    flat = x.view(B, C, -1)
+    B, C, D, H, W = source_mask.shape
+    device = source_mask.device
 
-    if mask is not None:
-        mask = mask.float().view(B, C, -1)
-        neg_val = torch.full_like(flat, -50.0)
-        flat = torch.where(mask > 0, flat, neg_val)
+    z = torch.arange(D, device=device, dtype=torch.float32).view(1, 1, D, 1, 1)
+    y = torch.arange(H, device=device, dtype=torch.float32).view(1, 1, 1, H, 1)
+    x = torch.arange(W, device=device, dtype=torch.float32).view(1, 1, 1, 1, W)
 
-    m = flat.max(dim=-1, keepdim=True).values
-    logits = beta * (flat - m)
-    prob = torch.softmax(logits, dim=-1)
+    w = (source_mask > 0.5).float()
 
-    zz = torch.linspace(-1.0, 1.0, D, device=x.device, dtype=torch.float32)
-    yy = torch.linspace(-1.0, 1.0, H, device=x.device, dtype=torch.float32)
-    xx = torch.linspace(-1.0, 1.0, W, device=x.device, dtype=torch.float32)
-    zz, yy, xx = torch.meshgrid(zz, yy, xx, indexing="ij")
+    mass = w.sum(dim=(2, 3, 4), keepdim=True)  # [B,1,1,1,1]
+    has_mass = (mass > 0).view(B)
 
-    coords = torch.stack([zz, yy, xx], dim=0).view(1, 1, 3, -1)
-    exp_coords = (prob.unsqueeze(2) * coords).sum(dim=-1)
-    return exp_coords.squeeze(1)
+    zc = (w * z).sum(dim=(2, 3, 4), keepdim=False) / (mass.view(B, 1) + 1e-6)
+    yc = (w * y).sum(dim=(2, 3, 4), keepdim=False) / (mass.view(B, 1) + 1e-6)
+    xc = (w * x).sum(dim=(2, 3, 4), keepdim=False) / (mass.view(B, 1) + 1e-6)
+
+    centers = torch.cat([zc, yc, xc], dim=1)  # [B,3]
+
+    # fallback si la m�scara est� vac�a: usar argmax
+    if not bool(has_mass.all()):
+        flat = source_mask.view(B, -1)
+        idx = flat.argmax(dim=1)
+
+        yz = H * W
+        z_idx = (idx // yz).float()
+        rem = idx % yz
+        y_idx = (rem // W).float()
+        x_idx = (rem % W).float()
+
+        fallback = torch.stack([z_idx, y_idx, x_idx], dim=1)
+        centers = torch.where(has_mass[:, None], centers, fallback)
+
+    return centers  # [B,3]
+
+
+def build_tube_roi_and_tcoord(source_mask: torch.Tensor,
+                              target: torch.Tensor,
+                              radius_vox: int = 3):
+    """
+    Construye un tubo entre centro de source_mask y pico GT.
+    source_mask: [B,1,D,H,W]
+    target:      [B,1,D,H,W]
+
+    returns:
+      tube_roi: [B,1,D,H,W]
+      t_coord:  [B,1,D,H,W]  en [0,1] aprox sobre el segmento
+      src_center: [B,3]
+      peak_center: [B,3]
+    """
+    B, C, D, H, W = target.shape
+    device = target.device
+    dtype = torch.float32
+
+    src_center = get_source_center_from_mask(source_mask).to(device=device, dtype=dtype)
+
+    z_idx, y_idx, x_idx = get_gt_peak_indices(target)
+    peak_center = torch.stack([
+        z_idx.float(), y_idx.float(), x_idx.float()
+    ], dim=1).to(device=device, dtype=dtype)  # [B,3]
+
+    z = torch.arange(D, device=device, dtype=dtype).view(1, D, 1, 1)
+    y = torch.arange(H, device=device, dtype=dtype).view(1, 1, H, 1)
+    x = torch.arange(W, device=device, dtype=dtype).view(1, 1, 1, W)
+
+    zz = z.expand(B, D, H, W)
+    yy = y.expand(B, D, H, W)
+    xx = x.expand(B, D, H, W)
+
+    p = torch.stack([zz, yy, xx], dim=-1)  # [B,D,H,W,3]
+
+    a = src_center.view(B, 1, 1, 1, 3)
+    b = peak_center.view(B, 1, 1, 1, 3)
+
+    ab = b - a
+    ap = p - a
+
+    ab2 = (ab * ab).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    t_raw = (ap * ab).sum(dim=-1, keepdim=True) / ab2
+    t = t_raw.clamp(0.0, 1.0)
+
+    closest = a + t * ab
+    dist2 = ((p - closest) ** 2).sum(dim=-1, keepdim=True)
+
+    tube_roi = (dist2 <= float(radius_vox ** 2)).float()  # [B,D,H,W,1]
+    tube_roi = tube_roi.permute(0, 4, 1, 2, 3).contiguous()  # [B,1,D,H,W]
+    t_coord = t.permute(0, 4, 1, 2, 3).contiguous()          # [B,1,D,H,W]
+
+    return tube_roi, t_coord, src_center, peak_center
+
+
+def compute_profile_loss(pred: torch.Tensor,
+                         target: torch.Tensor,
+                         tube_roi: torch.Tensor,
+                         t_coord: torch.Tensor,
+                         num_bins: int = 16,
+                         eps: float = 1e-6):
+    """
+    Compara el perfil axial dentro del tubo:
+    divide el segmento en bins seg�n t_coord y compara promedios.
+    """
+    device = pred.device
+    edges = torch.linspace(0.0, 1.0, num_bins + 1, device=device)
+
+    losses = []
+    for i in range(num_bins):
+        if i < num_bins - 1:
+            slab = (t_coord >= edges[i]) & (t_coord < edges[i + 1])
+        else:
+            slab = (t_coord >= edges[i]) & (t_coord <= edges[i + 1])
+
+        slab = slab.float() * tube_roi
+
+        pred_m = masked_mean(pred, slab, eps=eps)
+        tgt_m = masked_mean(target, slab, eps=eps)
+
+        l = torch.abs(pred_m - tgt_m) / (torch.abs(tgt_m) + eps)
+        losses.append(l)
+
+    return torch.stack(losses).mean()
 
 
 # =========================================================
-# Loss estable y progresiva para TUS
+# Loss Tube-Aware
 # =========================================================
-class StableFocusAwareTUSLoss(nn.Module):
+class StableTubeAwareTUSLoss(nn.Module):
     def __init__(
         self,
-        lambda_global=1.0,
-        lambda_focus=2.0,
-        lambda_peak=0.50,
-        lambda_loc=0.25,
-        lambda_grad=0.05,
+        lambda_global=0.8,
+        lambda_focus=1.5,
+        lambda_grad=0.08,
+        lambda_tube=1.0,
+        lambda_profile=0.6,
 
+        # ROI focal amplia
         focus_frac=0.50,
         focus_min_thr=0.08,
         focus_dilate_ks=7,
-        peak_frac=0.85,
+
+        # tubo
+        tube_radius_vox=3,
+        profile_bins=16,
 
         global_peak_weight=4.0,
         global_peak_gamma=2.0,
 
-        peak_warmup_start=10,
-        peak_warmup_end=30,
-        loc_warmup_start=20,
-        loc_warmup_end=45,
-
-        beta_peak_start=8.0,
-        beta_peak_end=25.0,
-        beta_loc_start=8.0,
-        beta_loc_end=35.0,
+        tube_warmup_start=3,
+        tube_warmup_end=12,
+        profile_warmup_start=5,
+        profile_warmup_end=15,
 
         eps=1e-6,
     ):
@@ -184,117 +262,120 @@ class StableFocusAwareTUSLoss(nn.Module):
 
         self.lambda_global = float(lambda_global)
         self.lambda_focus = float(lambda_focus)
-        self.lambda_peak = float(lambda_peak)
-        self.lambda_loc = float(lambda_loc)
         self.lambda_grad = float(lambda_grad)
+        self.lambda_tube = float(lambda_tube)
+        self.lambda_profile = float(lambda_profile)
 
         self.focus_frac = float(focus_frac)
         self.focus_min_thr = float(focus_min_thr)
         self.focus_dilate_ks = int(focus_dilate_ks)
-        self.peak_frac = float(peak_frac)
+
+        self.tube_radius_vox = int(tube_radius_vox)
+        self.profile_bins = int(profile_bins)
 
         self.global_peak_weight = float(global_peak_weight)
         self.global_peak_gamma = float(global_peak_gamma)
 
-        self.peak_warmup_start = int(peak_warmup_start)
-        self.peak_warmup_end = int(peak_warmup_end)
-        self.loc_warmup_start = int(loc_warmup_start)
-        self.loc_warmup_end = int(loc_warmup_end)
-
-        self.beta_peak_start = float(beta_peak_start)
-        self.beta_peak_end = float(beta_peak_end)
-        self.beta_loc_start = float(beta_loc_start)
-        self.beta_loc_end = float(beta_loc_end)
+        self.tube_warmup_start = int(tube_warmup_start)
+        self.tube_warmup_end = int(tube_warmup_end)
+        self.profile_warmup_start = int(profile_warmup_start)
+        self.profile_warmup_end = int(profile_warmup_end)
 
         self.eps = float(eps)
 
     def get_schedule(self, epoch: int):
-        r_peak = ramp_linear(epoch, self.peak_warmup_start,
-                             self.peak_warmup_end)
-        r_loc = ramp_linear(epoch, self.loc_warmup_start, self.loc_warmup_end)
-
-        beta_peak = interp_linear(
-            r_peak, self.beta_peak_start, self.beta_peak_end)
-        beta_loc = interp_linear(r_loc, self.beta_loc_start, self.beta_loc_end)
+        r_tube = ramp_linear(epoch, self.tube_warmup_start, self.tube_warmup_end)
+        r_profile = ramp_linear(epoch, self.profile_warmup_start, self.profile_warmup_end)
 
         return {
-            "r_peak": r_peak,
-            "r_loc": r_loc,
-            "beta_peak": beta_peak,
-            "beta_loc": beta_loc,
-            "lambda_peak_eff": self.lambda_peak * r_peak,
-            "lambda_loc_eff": self.lambda_loc * r_loc,
+            "r_tube": r_tube,
+            "r_profile": r_profile,
+            "lambda_tube_eff": self.lambda_tube * r_tube,
+            "lambda_profile_eff": self.lambda_profile * r_profile,
         }
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, epoch: int = 1, return_dict: bool = False):
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, source_mask: torch.Tensor,
+                epoch: int = 1, return_dict: bool = False):
         pred32 = pred.float()
         target32 = target.float()
-
         pred_pos = pred32.clamp_min(0.0)
+
         sched = self.get_schedule(epoch)
 
+        # -----------------------------------------
+        # ROI focal amplia
+        # -----------------------------------------
         focus_roi, peak = make_focus_roi(
             target32,
             frac=self.focus_frac,
             min_thr=self.focus_min_thr,
             dilate_ks=self.focus_dilate_ks
         )
-        peak_mask, _ = make_peak_mask(target32, frac=self.peak_frac)
 
+        # -----------------------------------------
         # 1) Global weighted L1
+        # -----------------------------------------
         rel = (target32 / peak).clamp(0.0, 1.0)
-        w_global = 1.0 + self.global_peak_weight * \
-            rel.pow(self.global_peak_gamma)
+        w_global = 1.0 + self.global_peak_weight * rel.pow(self.global_peak_gamma)
         loss_global = (torch.abs(pred_pos - target32) * w_global).mean()
 
-        # 2) Focus ROI relative MSE
-        focus_num = masked_mean(
-            (pred_pos - target32).pow(2), focus_roi, eps=self.eps)
-        focus_den = masked_mean(target32.pow(
-            2), focus_roi, eps=self.eps).clamp_min(self.eps)
+        # -----------------------------------------
+        # 2) Focus relative MSE
+        # -----------------------------------------
+        focus_num = masked_mean((pred_pos - target32).pow(2), focus_roi, eps=self.eps)
+        focus_den = masked_mean(target32.pow(2), focus_roi, eps=self.eps).clamp_min(self.eps)
         loss_focus = focus_num / focus_den
 
-        # 3) Focus grad relative loss
+        # -----------------------------------------
+        # 3) Grad relative loss en ROI focal
+        # -----------------------------------------
         pdx, pdy, pdz = grad3d(pred_pos)
         tdx, tdy, tdz = grad3d(target32)
 
-        grad_diff = torch.abs(pdx - tdx) + \
-            torch.abs(pdy - tdy) + torch.abs(pdz - tdz)
+        grad_diff = torch.abs(pdx - tdx) + torch.abs(pdy - tdy) + torch.abs(pdz - tdz)
         grad_ref = torch.abs(tdx) + torch.abs(tdy) + torch.abs(tdz)
 
         grad_num = masked_mean(grad_diff, focus_roi, eps=self.eps)
-        grad_den = masked_mean(grad_ref, focus_roi,
-                               eps=self.eps).clamp_min(self.eps)
+        grad_den = masked_mean(grad_ref, focus_roi, eps=self.eps).clamp_min(self.eps)
         loss_grad = grad_num / grad_den
 
-        # 4) Peak relative loss
-        if sched["lambda_peak_eff"] > 0.0:
-            pred_peak = approx_max(
-                pred_pos, mask=peak_mask, beta=sched["beta_peak"]).view(-1, 1)
-            targ_peak = approx_max(
-                target32, mask=peak_mask, beta=sched["beta_peak"]).view(-1, 1)
-            loss_peak = (torch.abs(pred_peak - targ_peak) /
-                         (torch.abs(targ_peak) + self.eps)).mean()
-        else:
-            loss_peak = torch.zeros(
-                (), device=pred.device, dtype=torch.float32)
+        # -----------------------------------------
+        # 4) Tube ROI
+        # -----------------------------------------
+        tube_roi, t_coord, src_center, peak_center = build_tube_roi_and_tcoord(
+            source_mask=source_mask,
+            target=target32,
+            radius_vox=self.tube_radius_vox
+        )
 
-        # 5) Peak location loss
-        if sched["lambda_loc_eff"] > 0.0:
-            pred_loc = soft_argmax3d(
-                pred_pos, mask=focus_roi, beta=sched["beta_loc"])
-            targ_loc = soft_argmax3d(
-                target32, mask=focus_roi, beta=sched["beta_loc"])
-            loss_loc = F.l1_loss(pred_loc, targ_loc)
+        if sched["lambda_tube_eff"] > 0.0:
+            tube_num = masked_mean((pred_pos - target32).pow(2), tube_roi, eps=self.eps)
+            tube_den = masked_mean(target32.pow(2), tube_roi, eps=self.eps).clamp_min(self.eps)
+            loss_tube = tube_num / tube_den
         else:
-            loss_loc = torch.zeros((), device=pred.device, dtype=torch.float32)
+            loss_tube = torch.zeros((), device=pred.device, dtype=torch.float32)
+
+        # -----------------------------------------
+        # 5) Axial profile loss dentro del tubo
+        # -----------------------------------------
+        if sched["lambda_profile_eff"] > 0.0:
+            loss_profile = compute_profile_loss(
+                pred=pred_pos,
+                target=target32,
+                tube_roi=tube_roi,
+                t_coord=t_coord,
+                num_bins=self.profile_bins,
+                eps=self.eps
+            )
+        else:
+            loss_profile = torch.zeros((), device=pred.device, dtype=torch.float32)
 
         total = (
             self.lambda_global * loss_global
             + self.lambda_focus * loss_focus
             + self.lambda_grad * loss_grad
-            + sched["lambda_peak_eff"] * loss_peak
-            + sched["lambda_loc_eff"] * loss_loc
+            + sched["lambda_tube_eff"] * loss_tube
+            + sched["lambda_profile_eff"] * loss_profile
         )
 
         if return_dict:
@@ -303,14 +384,12 @@ class StableFocusAwareTUSLoss(nn.Module):
                 "loss_global": float(loss_global.detach().item()),
                 "loss_focus": float(loss_focus.detach().item()),
                 "loss_grad": float(loss_grad.detach().item()),
-                "loss_peak": float(loss_peak.detach().item()),
-                "loss_loc": float(loss_loc.detach().item()),
-                "r_peak": float(sched["r_peak"]),
-                "r_loc": float(sched["r_loc"]),
-                "beta_peak": float(sched["beta_peak"]),
-                "beta_loc": float(sched["beta_loc"]),
-                "lambda_peak_eff": float(sched["lambda_peak_eff"]),
-                "lambda_loc_eff": float(sched["lambda_loc_eff"]),
+                "loss_tube": float(loss_tube.detach().item()),
+                "loss_profile": float(loss_profile.detach().item()),
+                "r_tube": float(sched["r_tube"]),
+                "r_profile": float(sched["r_profile"]),
+                "lambda_tube_eff": float(sched["lambda_tube_eff"]),
+                "lambda_profile_eff": float(sched["lambda_profile_eff"]),
             }
             return total, comp
 
@@ -321,11 +400,6 @@ class StableFocusAwareTUSLoss(nn.Module):
 # Visual Callback
 # =========================================================
 class VisualCallback:
-    """
-    Guarda visualizaciones de casos fijos de validación.
-    Configurado para ejecutarse cada N epochs.
-    """
-
     def __init__(
         self,
         save_dir,
@@ -361,8 +435,7 @@ class VisualCallback:
 
             self.samples.append((int(idx), x.clone().cpu(), y.clone().cpu()))
 
-        print(
-            f"🖼️ VisualCallback activo con casos fijos: {[s[0] for s in self.samples]}")
+        print(f"=� VisualCallback activo con casos fijos: {[s[0] for s in self.samples]}")
 
     def should_run(self, epoch: int) -> bool:
         return self.every_n_epochs > 0 and epoch % self.every_n_epochs == 0
@@ -381,12 +454,6 @@ class VisualCallback:
 
     @classmethod
     def _make_overlay(cls, gt2d: np.ndarray, pred2d: np.ndarray):
-        """
-        RGB overlay:
-        - rojo   = pred
-        - verde  = GT
-        - amarillo = solapamiento
-        """
         g = cls._norm_2d(gt2d)
         p = cls._norm_2d(pred2d)
         rgb = np.stack([p, g, np.zeros_like(g)], axis=-1)
@@ -409,7 +476,6 @@ class VisualCallback:
             (x_pr - x_gt) ** 2
         )
 
-        # slices fijadas según el pico del GT
         gt_ax = gt[z_gt, :, :]
         pr_ax = pred[z_gt, :, :]
         er_ax = err[z_gt, :, :]
@@ -434,18 +500,15 @@ class VisualCallback:
         vmax_err = max(float(err.max()), 1e-8)
 
         for r, (name, g, p, e) in enumerate(rows):
-            axes[r, 0].imshow(g, cmap="jet", origin="lower",
-                              vmin=0, vmax=vmax_main)
+            axes[r, 0].imshow(g, cmap="jet", origin="lower", vmin=0, vmax=vmax_main)
             axes[r, 0].set_title(f"{name} | GT")
             axes[r, 0].axis("off")
 
-            axes[r, 1].imshow(p, cmap="jet", origin="lower",
-                              vmin=0, vmax=vmax_main)
+            axes[r, 1].imshow(p, cmap="jet", origin="lower", vmin=0, vmax=vmax_main)
             axes[r, 1].set_title(f"{name} | Pred")
             axes[r, 1].axis("off")
 
-            axes[r, 2].imshow(e, cmap="magma", origin="lower",
-                              vmin=0, vmax=vmax_err)
+            axes[r, 2].imshow(e, cmap="magma", origin="lower", vmin=0, vmax=vmax_err)
             axes[r, 2].set_title(f"{name} | |Error|")
             axes[r, 2].axis("off")
 
@@ -469,14 +532,12 @@ class VisualCallback:
 
         fig.tight_layout(rect=[0, 0, 1, 0.96])
 
-        out_png = os.path.join(
-            self.out_dir, f"epoch_{epoch:03d}_case_{case_idx:03d}.png")
+        out_png = os.path.join(self.out_dir, f"epoch_{epoch:03d}_case_{case_idx:03d}.png")
         fig.savefig(out_png, dpi=160, bbox_inches="tight")
         plt.close(fig)
 
         if self.save_raw_npz:
-            out_npz = os.path.join(
-                self.out_dir, f"epoch_{epoch:03d}_case_{case_idx:03d}.npz")
+            out_npz = os.path.join(self.out_dir, f"epoch_{epoch:03d}_case_{case_idx:03d}.npz")
             np.savez_compressed(
                 out_npz,
                 pred=pred.astype(np.float32),
@@ -501,8 +562,7 @@ class VisualCallback:
             else nullcontext()
         )
 
-        print(
-            f"🖼️ Guardando visualizaciones de validación en epoch {epoch:03d}...")
+        print(f"=� Guardando visualizaciones de validaci�n en epoch {epoch:03d}...")
 
         for case_idx, x_cpu, y_cpu in self.samples:
             X = x_cpu.unsqueeze(0).to(self.device, non_blocking=True)
@@ -524,12 +584,11 @@ class VisualCallback:
 # =========================================================
 def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
                     epoch: int,
-                    accum_steps=1, grad_clip=2.0, use_amp=True):
+                    grad_clip=2.0, use_amp=True):
     model.train()
 
     total = 0.0
     n_batches = 0
-    accum_counter = 0
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -537,61 +596,37 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
         X = X.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
+        source_mask = X[:, 0:1]  # asumimos canal 0 = source_mask
+
         amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if (
             use_amp and device == "cuda") else nullcontext()
 
         with amp_ctx:
             pred = model(X)
-
-        loss = criterion(pred, y, epoch=epoch) / accum_steps
+            loss = criterion(pred, y, source_mask=source_mask, epoch=epoch)
 
         if not torch.isfinite(loss):
-            print(
-                f"⚠️ Non-finite loss en train, epoch {epoch}, step {step}. Batch saltado.")
+            print(f"� Non-finite loss en train, epoch {epoch}, step {step}. Batch saltado.")
             optimizer.zero_grad(set_to_none=True)
-            accum_counter = 0
             continue
 
         if device == "cuda" and use_amp:
             scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        accum_counter += 1
-
-        if accum_counter >= accum_steps:
+            scaler.unscale_(optimizer)
             if grad_clip is not None and grad_clip > 0:
-                if device == "cuda" and use_amp:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=float(grad_clip))
-
-            if device == "cuda" and use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-
-            optimizer.zero_grad(set_to_none=True)
-            accum_counter = 0
-
-        total += float(loss.item()) * accum_steps
-        n_batches += 1
-
-    if accum_counter > 0:
-        if grad_clip is not None and grad_clip > 0:
-            if device == "cuda" and use_amp:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=float(grad_clip))
-
-        if device == "cuda" and use_amp:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
             scaler.step(optimizer)
             scaler.update()
         else:
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
             optimizer.step()
 
         optimizer.zero_grad(set_to_none=True)
+
+        total += float(loss.item())
+        n_batches += 1
 
     return total / max(1, n_batches)
 
@@ -607,29 +642,29 @@ def eval_one_epoch(model, loader, criterion, device, epoch: int, use_amp=True):
         "loss_global": 0.0,
         "loss_focus": 0.0,
         "loss_grad": 0.0,
-        "loss_peak": 0.0,
-        "loss_loc": 0.0,
-        "r_peak": 0.0,
-        "r_loc": 0.0,
-        "beta_peak": 0.0,
-        "beta_loc": 0.0,
-        "lambda_peak_eff": 0.0,
-        "lambda_loc_eff": 0.0,
+        "loss_tube": 0.0,
+        "loss_profile": 0.0,
+        "r_tube": 0.0,
+        "r_profile": 0.0,
+        "lambda_tube_eff": 0.0,
+        "lambda_profile_eff": 0.0,
     }
 
     for X, y in loader:
         X = X.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
+        source_mask = X[:, 0:1]
+
         amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if (
             use_amp and device == "cuda") else nullcontext()
+
         with amp_ctx:
             pred = model(X)
-
-        loss, comp = criterion(pred, y, epoch=epoch, return_dict=True)
+            loss, comp = criterion(pred, y, source_mask=source_mask, epoch=epoch, return_dict=True)
 
         if not torch.isfinite(loss):
-            print(f"⚠️ Non-finite loss en val, epoch {epoch}. Batch saltado.")
+            print(f"� Non-finite loss en val, epoch {epoch}. Batch saltado.")
             continue
 
         total += float(loss.item())
@@ -651,33 +686,16 @@ def eval_one_epoch(model, loader, criterion, device, epoch: int, use_amp=True):
 # =========================================================
 # Checkpointing
 # =========================================================
-def save_ckpt(path, model, optimizer, scaler, epoch, best_val, stats, config):
+def save_ckpt(path, model, optimizer, scaler, epoch, best_val, config):
     ckpt = {
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
         "epoch": int(epoch),
         "best_val": float(best_val),
-        "stats": stats,
         "config": config,
     }
     torch.save(ckpt, path)
-
-
-def load_ckpt(path, model, optimizer=None, scaler=None, device="cpu"):
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-
-    if optimizer is not None and ckpt.get("optimizer") is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
-
-    epoch = int(ckpt.get("epoch", 0))
-    best_val = float(ckpt.get("best_val", float("inf")))
-    stats = ckpt.get("stats", None)
-    config = ckpt.get("config", None)
-    return epoch, best_val, stats, config
 
 
 # =========================================================
@@ -694,14 +712,12 @@ def init_csv(csv_path):
                 "val_loss_global",
                 "val_loss_focus",
                 "val_loss_grad",
-                "val_loss_peak",
-                "val_loss_loc",
-                "r_peak",
-                "r_loc",
-                "beta_peak",
-                "beta_loc",
-                "lambda_peak_eff",
-                "lambda_loc_eff",
+                "val_loss_tube",
+                "val_loss_profile",
+                "r_tube",
+                "r_profile",
+                "lambda_tube_eff",
+                "lambda_profile_eff",
                 "lr",
                 "time_sec",
             ])
@@ -717,14 +733,12 @@ def append_csv(csv_path, epoch, train_loss, val_loss, val_comp, lr, time_sec):
             f"{val_comp['loss_global']:.8f}",
             f"{val_comp['loss_focus']:.8f}",
             f"{val_comp['loss_grad']:.8f}",
-            f"{val_comp['loss_peak']:.8f}",
-            f"{val_comp['loss_loc']:.8f}",
-            f"{val_comp['r_peak']:.4f}",
-            f"{val_comp['r_loc']:.4f}",
-            f"{val_comp['beta_peak']:.4f}",
-            f"{val_comp['beta_loc']:.4f}",
-            f"{val_comp['lambda_peak_eff']:.6f}",
-            f"{val_comp['lambda_loc_eff']:.6f}",
+            f"{val_comp['loss_tube']:.8f}",
+            f"{val_comp['loss_profile']:.8f}",
+            f"{val_comp['r_tube']:.4f}",
+            f"{val_comp['r_profile']:.4f}",
+            f"{val_comp['lambda_tube_eff']:.6f}",
+            f"{val_comp['lambda_profile_eff']:.6f}",
             f"{lr:.8e}",
             f"{time_sec:.2f}",
         ])
@@ -739,17 +753,20 @@ def main():
     # =========================
     SEED = 123
 
-    
-    SAVE_DIR = "checkpoints_unet_V2"
+    SAVE_DIR = "checkpoints_unet_expDexpC2"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
+    TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
+    VAL_DIR   = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
+    TEST_DIR  = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
+
+    OLD_CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_ExpC/epoch_050.pth"
     BATCH_SIZE = 1
-    ACCUM_STEPS = 2
     NUM_WORKERS = 2
     PIN_MEMORY = True
 
-    EPOCHS = 100
-    LR = 1e-4
+    EPOCHS = 40
+    LR = 1e-5
     WEIGHT_DECAY = 1e-4
 
     BASE = 16
@@ -760,18 +777,11 @@ def main():
     PLATEAU_PATIENCE = 6
     PLATEAU_FACTOR = 0.5
 
-    RESUME = False
-    RESUME_PATH = os.path.join(SAVE_DIR, "last.pth")
-
-    TRAIN_RATIO = 0.85
-    VAL_RATIO = 0.10
-
     SAVE_EVERY_N_EPOCHS = 10
-    SPECIFIC_SAVE_EPOCHS = {70, 80, 90, 100}
+    SPECIFIC_SAVE_EPOCHS = {10, 20, 30, 40}
 
     CSV_PATH = os.path.join(SAVE_DIR, "training_log.csv")
 
-    # Visual Callback
     VISUAL_EVERY_N_EPOCHS = 10
     VISUAL_FIXED_INDICES = (0, 5, 10)
     VISUAL_SAVE_RAW_NPZ = True
@@ -790,15 +800,9 @@ def main():
         except Exception:
             pass
 
-    
-
     # =========================
     # DATA
     # =========================
-    TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
-    VAL_DIR   = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
-    TEST_DIR  = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
-
     train_ds = TusDataset(TRAIN_DIR)
     val_ds   = TusDataset(VAL_DIR)
     test_ds  = TusDataset(TEST_DIR)
@@ -824,7 +828,6 @@ def main():
         persistent_workers=(NUM_WORKERS > 0),
         prefetch_factor=2 if NUM_WORKERS > 0 else None
     )
-    
 
     # =========================
     # MODEL
@@ -838,38 +841,41 @@ def main():
         out_positive=OUT_POSITIVE
     ).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=LR,
-                            weight_decay=WEIGHT_DECAY)
+    if os.path.exists(OLD_CKPT_PATH):
+        print(f"= Fine-tuning from old checkpoint: {OLD_CKPT_PATH}")
+        ckpt = torch.load(OLD_CKPT_PATH, map_location=device)
+        model.load_state_dict(ckpt["model"], strict=True)
+    else:
+        raise FileNotFoundError(f"No se encontr� OLD_CKPT_PATH: {OLD_CKPT_PATH}")
+
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     try:
         scaler = GradScaler("cuda", enabled=(device == "cuda"))
     except TypeError:
         scaler = GradScaler(enabled=(device == "cuda"))
 
-    criterion = StableFocusAwareTUSLoss(
-        lambda_global=1.0,
-        lambda_focus=2.0,
-        lambda_peak=0.50,
-        lambda_loc=0.25,
-        lambda_grad=0.05,
+    criterion = StableTubeAwareTUSLoss(
+        lambda_global=0.8,
+        lambda_focus=1.5,
+        lambda_grad=0.08,
+        lambda_tube=1.0,
+        lambda_profile=0.6,
 
         focus_frac=0.50,
         focus_min_thr=0.08,
         focus_dilate_ks=7,
-        peak_frac=0.85,
+
+        tube_radius_vox=3,
+        profile_bins=16,
 
         global_peak_weight=4.0,
         global_peak_gamma=2.0,
 
-        peak_warmup_start=10,
-        peak_warmup_end=30,
-        loc_warmup_start=20,
-        loc_warmup_end=45,
-
-        beta_peak_start=8.0,
-        beta_peak_end=25.0,
-        beta_loc_start=8.0,
-        beta_loc_end=35.0,
+        tube_warmup_start=3,
+        tube_warmup_end=12,
+        profile_warmup_start=5,
+        profile_warmup_end=15,
 
         eps=1e-6,
     )
@@ -903,64 +909,29 @@ def main():
             )
 
     # =========================
-    # RESUME
+    # CONFIG SAVE
     # =========================
-    start_epoch = 0
     best_val = float("inf")
-    stats = None
     config = {
         "SEED": SEED,
-        "TRAIN_RATIO": TRAIN_RATIO,
-        "VAL_RATIO": VAL_RATIO,
-        "BATCH_SIZE": BATCH_SIZE,
-        "ACCUM_STEPS": ACCUM_STEPS,
-        "NUM_WORKERS": NUM_WORKERS,
         "EPOCHS": EPOCHS,
         "LR": LR,
         "WEIGHT_DECAY": WEIGHT_DECAY,
-        "BASE": BASE,
-        "USE_SE": USE_SE,
-        "OUT_POSITIVE": OUT_POSITIVE,
-        "SAVE_EVERY_N_EPOCHS": SAVE_EVERY_N_EPOCHS,
-        "SPECIFIC_SAVE_EPOCHS": sorted(list(SPECIFIC_SAVE_EPOCHS)),
-        "VISUAL_EVERY_N_EPOCHS": VISUAL_EVERY_N_EPOCHS,
-        "VISUAL_FIXED_INDICES": list(VISUAL_FIXED_INDICES),
-        "VISUAL_SAVE_RAW_NPZ": VISUAL_SAVE_RAW_NPZ,
+        "OLD_CKPT_PATH": OLD_CKPT_PATH,
         "LOSS": {
-            "lambda_global": 1.0,
-            "lambda_focus": 2.0,
-            "lambda_peak": 0.50,
-            "lambda_loc": 0.25,
-            "lambda_grad": 0.05,
-
-            "focus_frac": 0.50,
-            "focus_min_thr": 0.08,
-            "focus_dilate_ks": 7,
-            "peak_frac": 0.85,
-
-            "global_peak_weight": 4.0,
-            "global_peak_gamma": 2.0,
-
-            "peak_warmup_start": 10,
-            "peak_warmup_end": 30,
-            "loc_warmup_start": 20,
-            "loc_warmup_end": 45,
-
-            "beta_peak_start": 8.0,
-            "beta_peak_end": 25.0,
-            "beta_loc_start": 8.0,
-            "beta_loc_end": 35.0,
+            "lambda_global": 0.8,
+            "lambda_focus": 1.5,
+            "lambda_grad": 0.08,
+            "lambda_tube": 1.0,
+            "lambda_profile": 0.6,
+            "tube_radius_vox": 3,
+            "profile_bins": 16,
+            "tube_warmup_start": 3,
+            "tube_warmup_end": 12,
+            "profile_warmup_start": 5,
+            "profile_warmup_end": 15,
         }
     }
-
-    if RESUME and os.path.exists(RESUME_PATH):
-        print(f"🔄 Resuming from: {RESUME_PATH}")
-        start_epoch, best_val, stats_ckpt, _ = load_ckpt(
-            RESUME_PATH, model, optimizer, scaler, device=device
-        )
-        if stats_ckpt is not None:
-            stats = stats_ckpt
-        print(f"   start_epoch={start_epoch} | best_val={best_val:.6f}")
 
     with open(os.path.join(SAVE_DIR, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
@@ -970,13 +941,12 @@ def main():
     # =========================
     # TRAIN
     # =========================
-    for epoch in range(start_epoch + 1, EPOCHS + 1):
+    for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
 
         tr = train_one_epoch(
             model, train_loader, optimizer, scaler, criterion, device,
             epoch=epoch,
-            accum_steps=ACCUM_STEPS,
             grad_clip=2.0,
             use_amp=True
         )
@@ -999,43 +969,40 @@ def main():
             f"train={tr:.6f} | val={va:.6f} | "
             f"glob={va_comp['loss_global']:.4f} | "
             f"focus={va_comp['loss_focus']:.4f} | "
-            f"peak={va_comp['loss_peak']:.4f} | "
-            f"loc={va_comp['loss_loc']:.4f} | "
+            f"grad={va_comp['loss_grad']:.4f} | "
+            f"tube={va_comp['loss_tube']:.4f} | "
+            f"profile={va_comp['loss_profile']:.4f} | "
             f"lr={new_lr:.2e} | time={dt:.1f}s"
         )
 
         if new_lr < prev_lr:
-            print(f"🔻 LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
+            print(f"=; LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
 
         append_csv(CSV_PATH, epoch, tr, va, va_comp, new_lr, dt)
 
-        # Guardar last
         save_ckpt(
             os.path.join(SAVE_DIR, "last.pth"),
-            model, optimizer, scaler, epoch, best_val, stats, config
+            model, optimizer, scaler, epoch, best_val, config
         )
 
-        # Guardar best
         if va < best_val:
             best_val = va
             save_ckpt(
                 os.path.join(SAVE_DIR, "best.pth"),
-                model, optimizer, scaler, epoch, best_val, stats, config
+                model, optimizer, scaler, epoch, best_val, config
             )
-            print(f"✅ New best val: {best_val:.6f}")
+            print(f" New best val: {best_val:.6f}")
 
-        # Guardado periódico de checkpoints
-        if (SAVE_EVERY_N_EPOCHS >= 50 and epoch % SAVE_EVERY_N_EPOCHS == 0) or (epoch in SPECIFIC_SAVE_EPOCHS):
+        if (epoch % SAVE_EVERY_N_EPOCHS == 0) or (epoch in SPECIFIC_SAVE_EPOCHS):
             save_ckpt(
                 os.path.join(SAVE_DIR, f"epoch_{epoch:03d}.pth"),
-                model, optimizer, scaler, epoch, best_val, stats, config
+                model, optimizer, scaler, epoch, best_val, config
             )
-            print(f"💾 Saved checkpoint: epoch_{epoch:03d}.pth")
+            print(f"=� Saved checkpoint: epoch_{epoch:03d}.pth")
 
-        # Visual callback cada 10 epochs
         visual_cb(model, epoch)
 
-    print("✅ Training done. Best val:", best_val)
+    print(" Training done. Best val:", best_val)
 
 
 if __name__ == "__main__":

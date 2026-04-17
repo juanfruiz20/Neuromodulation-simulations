@@ -14,8 +14,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from Data_loaderV2 import TusDataset
-from Unet3D_V2 import ResUNet3D_HQ
+from src.dataloader import TusDataset
+from src.modelos.ResUnet3D import ResUNet3D_HQ
 
 try:
     from torch.amp import GradScaler

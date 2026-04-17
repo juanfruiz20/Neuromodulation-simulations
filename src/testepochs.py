@@ -6,13 +6,10 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from scipy.ndimage import binary_fill_holes
 
-from Unet3D_V2 import ResUNet3D_HQ
-
+from src.modelos.ResUnet3D import ResUNet3D_HQ
 
 # =========================================================
 # SSIM opcional
@@ -33,17 +30,13 @@ except ImportError:
 # CONFIG
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpC2"
+OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain_expC")
 
-# Pon aqu� la carpeta de los checkpoints que quieras evaluar
-# Puede ser de UNet normal o de GAN refiner
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_refiner_expDexpB"
-
-OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Si quieres forzarlo manualmente, d�jalo aqu�.
-# Si el checkpoint GAN trae DX_MM en config, se usar� ese.
-DX_MM_DEFAULT = 1.0
+# Si el dataset se gener� con dx=1 mm, d�jalo en 1.0
+DX_MM = 1.0
 
 NUM_WORKERS = 0
 PIN_MEMORY = True
@@ -57,14 +50,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 def discover_checkpoints(ckpt_dir: str) -> List[str]:
     names = []
 
-    fixed_candidates = [
-        "best.pth",
-        "last.pth",
-        "best_gan_refiner.pth",
-        "last_gan_refiner.pth",
-    ]
-
-    for fixed_name in fixed_candidates:
+    for fixed_name in ["best.pth", "last.pth"]:
         p = os.path.join(ckpt_dir, fixed_name)
         if os.path.exists(p):
             names.append(fixed_name)
@@ -119,7 +105,8 @@ class TusTestDataset(Dataset):
         self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
         if len(self.files) == 0:
-            raise RuntimeError(f"No se encontraron archivos .npz en: {data_dir}")
+            raise RuntimeError(
+                f"No se encontraron archivos .npz en: {data_dir}")
 
     def __len__(self):
         return len(self.files)
@@ -146,7 +133,6 @@ class TusTestDataset(Dataset):
 
         brain = reconstruct_brain_mask(skull, is_water_only)
 
-        # OJO: mismo orden de canales que el entrenamiento
         X = np.stack([src, skull], axis=0)   # [2, D, H, W]
         y = y[np.newaxis, ...]               # [1, D, H, W]
         brain = brain[np.newaxis, ...]       # [1, D, H, W]
@@ -161,112 +147,12 @@ class TusTestDataset(Dataset):
 
 
 # =========================================================
-# MODELOS DEL GAN REFINER
-# =========================================================
-class ConvBlock3D(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, norm: bool = True):
-        super().__init__()
-        layers = [
-            nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=not norm)
-        ]
-        if norm:
-            num_groups = 8 if out_ch >= 8 else 1
-            layers.append(nn.GroupNorm(num_groups=num_groups, num_channels=out_ch))
-        layers.append(nn.LeakyReLU(0.2, inplace=True))
-        self.block = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class ResidualBlock3D(nn.Module):
-    def __init__(self, ch: int):
-        super().__init__()
-        num_groups = 8 if ch >= 8 else 1
-        self.conv1 = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
-        self.gn1 = nn.GroupNorm(num_groups=num_groups, num_channels=ch)
-        self.conv2 = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
-        self.gn2 = nn.GroupNorm(num_groups=num_groups, num_channels=ch)
-        self.act = nn.LeakyReLU(0.2, inplace=True)
-
-    def forward(self, x):
-        r = x
-        x = self.act(self.gn1(self.conv1(x)))
-        x = self.gn2(self.conv2(x))
-        x = self.act(x + r)
-        return x
-
-
-class DownBlock3D(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.block = nn.Sequential(
-            ConvBlock3D(in_ch, out_ch, stride=2, norm=True),
-            ConvBlock3D(out_ch, out_ch, stride=1, norm=True),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class UpBlock3D(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
-        super().__init__()
-        self.conv1 = ConvBlock3D(in_ch + skip_ch, out_ch, stride=1, norm=True)
-        self.conv2 = ConvBlock3D(out_ch, out_ch, stride=1, norm=True)
-
-    def forward(self, x, skip):
-        x = F.interpolate(x, size=skip.shape[-3:], mode="trilinear", align_corners=False)
-        x = torch.cat([x, skip], dim=1)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return x
-
-
-class ResidualRefiner3D(nn.Module):
-    def __init__(self, x_ch: int = 2):
-        super().__init__()
-        in_ch = x_ch + 1  # X + y_base
-
-        self.enc1 = nn.Sequential(
-            ConvBlock3D(in_ch, 16, stride=1, norm=True),
-            ConvBlock3D(16, 16, stride=1, norm=True),
-        )
-        self.down1 = DownBlock3D(16, 32)
-        self.down2 = DownBlock3D(32, 64)
-
-        self.bottleneck = nn.Sequential(
-            ResidualBlock3D(64),
-            ResidualBlock3D(64),
-        )
-
-        self.up1 = UpBlock3D(64, 32, 32)
-        self.up2 = UpBlock3D(32, 16, 16)
-
-        self.out_conv = nn.Conv3d(16, 1, kernel_size=1)
-
-    def forward(self, x, y_base):
-        z = torch.cat([x, y_base], dim=1)
-
-        s1 = self.enc1(z)
-        s2 = self.down1(s1)
-        s3 = self.down2(s2)
-
-        b = self.bottleneck(s3)
-
-        u1 = self.up1(b, s2)
-        u2 = self.up2(u1, s1)
-
-        delta = torch.tanh(self.out_conv(u2))
-        return delta
-
-
-# =========================================================
 # HELPERS
 # =========================================================
-def load_base_unet_from_ckpt(ckpt_path: str, device: str):
+def load_model(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device)
 
+    # Mantiene tu arquitectura importada desde Model_Unet3D
     model = ResUNet3D_HQ(
         in_ch=2,
         out_ch=1,
@@ -279,91 +165,6 @@ def load_base_unet_from_ckpt(ckpt_path: str, device: str):
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
     return model, ckpt
-
-
-def load_predictor(ckpt_path: str, device: str):
-    """
-    Devuelve:
-      predictor_type: "unet" o "gan_refiner"
-      predictor: modelo o dict de modelos
-      ckpt
-      dx_mm
-      alpha_resid
-    """
-    ckpt = torch.load(ckpt_path, map_location=device)
-
-    # -----------------------------------------------------
-    # Caso 1: checkpoint de UNet normal
-    # -----------------------------------------------------
-    if "model" in ckpt:
-        model = ResUNet3D_HQ(
-            in_ch=2,
-            out_ch=1,
-            base=16,
-            norm_kind="group",
-            use_se=True,
-            out_positive=True,
-        ).to(device)
-
-        model.load_state_dict(ckpt["model"], strict=True)
-        model.eval()
-
-        dx_mm = float(ckpt.get("config", {}).get("DX_MM", DX_MM_DEFAULT))
-        alpha_resid = None
-        return "unet", model, ckpt, dx_mm, alpha_resid
-
-    # -----------------------------------------------------
-    # Caso 2: checkpoint de GAN refiner
-    # -----------------------------------------------------
-    if "refiner" in ckpt:
-        base_ckpt_path = ckpt.get("base_ckpt_path", None)
-        if base_ckpt_path is None:
-            raise RuntimeError(
-                f"El checkpoint {ckpt_path} parece GAN refiner pero no trae 'base_ckpt_path'."
-            )
-        if not os.path.exists(base_ckpt_path):
-            raise RuntimeError(
-                f"No se encuentra el checkpoint base del UNet: {base_ckpt_path}"
-            )
-
-        base_model, _ = load_base_unet_from_ckpt(base_ckpt_path, device)
-
-        refiner = ResidualRefiner3D(x_ch=2).to(device)
-        refiner.load_state_dict(ckpt["refiner"], strict=True)
-        refiner.eval()
-
-        predictor = {
-            "base_model": base_model,
-            "refiner": refiner,
-        }
-
-        dx_mm = float(ckpt.get("config", {}).get("DX_MM", DX_MM_DEFAULT))
-        alpha_resid = float(ckpt.get("alpha_resid", 0.15))
-        return "gan_refiner", predictor, ckpt, dx_mm, alpha_resid
-
-    raise RuntimeError(
-        f"No reconozco el formato del checkpoint: {ckpt_path}. "
-        f"Claves encontradas: {list(ckpt.keys())}"
-    )
-
-
-def forward_predictor(predictor_type: str, predictor, X: torch.Tensor, alpha_resid: float = None):
-    if predictor_type == "unet":
-        pred = predictor(X)
-        pred = pred.clamp_min(0.0)
-        return pred
-
-    if predictor_type == "gan_refiner":
-        base_model = predictor["base_model"]
-        refiner = predictor["refiner"]
-
-        y_base = base_model(X).clamp_min(0.0)
-        delta = refiner(X, y_base)
-        pred = y_base + alpha_resid * delta
-        pred = pred.clamp_min(0.0)
-        return pred
-
-    raise ValueError(f"predictor_type no soportado: {predictor_type}")
 
 
 def get_peak_index_masked(vol: np.ndarray, mask: np.ndarray) -> Tuple[int, int, int]:
@@ -388,13 +189,14 @@ def compute_ssim_safe(a: np.ndarray, b: np.ndarray, data_range: float = 1.0) -> 
     if not HAS_SKIMAGE:
         return float("nan")
 
+    # Check if arrays have valid shape for SSIM
     if min(a.shape) < 7 or min(b.shape) < 7:
         return float("nan")
 
     try:
         return float(skimage_ssim(a, b, data_range=data_range))
     except Exception as e:
-        print(f"� SSIM computation failed: {e}")
+        print(f"⚠️ SSIM computation failed: {e}")
         return float("nan")
 
 
@@ -472,10 +274,12 @@ def compute_metrics_one_sample(
     pred_brain_crop = crop_to_mask_bbox(pred_brain_vol, brain_mask)
     gt_brain_crop = crop_to_mask_bbox(gt_brain_vol, brain_mask)
 
+    # Ensure crops have minimum size before SSIM
     if min(pred_brain_crop.shape) < 7 or min(gt_brain_crop.shape) < 7:
         ssim_brain = float("nan")
     else:
-        ssim_brain = compute_ssim_safe(pred_brain_crop, gt_brain_crop, data_range=1.0)
+        ssim_brain = compute_ssim_safe(
+            pred_brain_crop, gt_brain_crop, data_range=1.0)
 
     # -----------------------------
     # Peak in brain
@@ -617,7 +421,7 @@ def rankdata_asc(values: List[float]) -> np.ndarray:
 
 @torch.no_grad()
 def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
-    predictor_type, predictor, ckpt, dx_mm, alpha_resid = load_predictor(ckpt_path, device)
+    model, ckpt = load_model(ckpt_path, device)
     all_rows = []
 
     for batch in loader:
@@ -627,12 +431,8 @@ def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
         is_water_only = bool(batch["is_water_only"][0])
         file_name = batch["file_name"][0]
 
-        pred = forward_predictor(
-            predictor_type=predictor_type,
-            predictor=predictor,
-            X=X,
-            alpha_resid=alpha_resid,
-        )
+        pred = model(X)
+        pred = pred.clamp_min(0.0)
 
         pred_np = pred[0, 0].detach().cpu().numpy()
         gt_np = y[0, 0].detach().cpu().numpy()
@@ -642,13 +442,13 @@ def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
             pred=pred_np,
             gt=gt_np,
             brain_mask=brain_np,
-            dx_mm=dx_mm,
+            dx_mm=DX_MM,
             is_water_only=is_water_only,
         )
         metrics["file"] = file_name
         all_rows.append(metrics)
 
-    return all_rows, ckpt, predictor_type, dx_mm
+    return all_rows, ckpt
 
 
 def build_ranking(ranking_rows: List[Dict[str, float]]) -> List[Dict[str, float]]:
@@ -696,6 +496,7 @@ def main():
     print("TEST_DIR:", TEST_DIR)
     print("CKPT_DIR:", CKPT_DIR)
     print("OUT_DIR:", OUT_DIR)
+    print("DX_MM:", DX_MM)
     print("Checkpoints found:", CKPT_NAMES)
 
     if len(CKPT_NAMES) == 0:
@@ -721,7 +522,7 @@ def main():
             continue
 
         print(f"\nEvaluando {ckpt_name} ...")
-        rows, ckpt, predictor_type, dx_mm = evaluate_checkpoint(ckpt_path, test_loader, DEVICE)
+        rows, ckpt = evaluate_checkpoint(ckpt_path, test_loader, DEVICE)
 
         per_sample_csv = os.path.join(
             OUT_DIR, f"{os.path.splitext(ckpt_name)[0]}_per_sample.csv"
@@ -731,8 +532,6 @@ def main():
         summary = summarize_metrics(rows)
         summary["checkpoint"] = ckpt_name
         summary["epoch"] = int(ckpt.get("epoch", -1))
-        summary["predictor_type"] = predictor_type
-        summary["dx_mm"] = dx_mm
 
         summary_csv = os.path.join(
             OUT_DIR, f"{os.path.splitext(ckpt_name)[0]}_summary.csv"
@@ -742,8 +541,6 @@ def main():
         ranking_rows.append({
             "checkpoint": ckpt_name,
             "epoch": int(ckpt.get("epoch", -1)),
-            "predictor_type": predictor_type,
-            "dx_mm": dx_mm,
             "n_samples": int(summary["n_samples"]),
             "n_water_only": int(summary["n_water_only"]),
             "n_non_water_only": int(summary["n_non_water_only"]),
@@ -762,7 +559,6 @@ def main():
 
         print(
             f"{ckpt_name} | "
-            f"type={predictor_type} | "
             f"peak_loc_mm_brain={summary['mean_peak_loc_err_mm_brain']:.4f} | "
             f"peak_rel_brain={summary['mean_peak_rel_err_brain']:.4f} | "
             f"mae_brain={summary['mean_mae_brain']:.4f} | "
@@ -787,7 +583,7 @@ def main():
     print("\nTop checkpoints:")
     for row in ranking_rows[:5]:
         print(
-            f"  {row['checkpoint']} | epoch={row['epoch']} | type={row['predictor_type']} | "
+            f"  {row['checkpoint']} | epoch={row['epoch']} | "
             f"score={row['composite_score']:.3f} | "
             f"peak_loc_mm={row['mean_peak_loc_err_mm_brain']:.4f} | "
             f"peak_rel={row['mean_peak_rel_err_brain']:.4f} | "
