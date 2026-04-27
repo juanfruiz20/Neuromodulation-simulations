@@ -10,6 +10,8 @@ dependencies = [
     "pandas>=2.3.3",
     "scikit-image>=0.25.2",
     "scikit-learn>=1.7.2",
+    "setuptools<82",
+    "tensorboard>=2.20.0",
     "torch>=2.10.0",
 ]
 [build-system]

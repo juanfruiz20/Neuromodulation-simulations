@@ -22,7 +22,7 @@ from src.modelos.ResUnet3D import ResUNet3D_HQ
 from src.modelos.Discriminator3D import PatchDiscriminator3D
 
 try:
-    from torch.amp.grad_scaler import GradScaler
+    from torch.amp import GradScaler
 except Exception:
     from torch.cuda.amp import GradScaler
 
@@ -38,7 +38,7 @@ def seed_all(seed: int = 123):
 
 
 # =========================================================
-# Helpers básicos
+# Helpers b�sicos
 # =========================================================
 def grad3d(x: torch.Tensor):
     dx = x[:, :, 1:, :, :] - x[:, :, :-1, :, :]
@@ -81,7 +81,7 @@ def make_focus_roi(target: torch.Tensor, frac: float, min_thr: float, dilate_ks:
 
 
 # =========================================================
-# Helpers geométricos para tube ROI
+# Helpers geom�tricos para tube ROI
 # =========================================================
 def get_gt_peak_indices(target: torch.Tensor):
     """
@@ -157,8 +157,7 @@ def build_tube_roi_and_tcoord(source_mask: torch.Tensor,
     device = target.device
     dtype = torch.float32
 
-    src_center = get_source_center_from_mask(
-        source_mask).to(device=device, dtype=dtype)
+    src_center = get_source_center_from_mask(source_mask).to(device=device, dtype=dtype)
 
     z_idx, y_idx, x_idx = get_gt_peak_indices(target)
     peak_center = torch.stack([
@@ -203,7 +202,7 @@ def compute_profile_loss(pred: torch.Tensor,
                          eps: float = 1e-6):
     """
     Compara el perfil axial dentro del tubo:
-    divide el segmento en bins según t_coord y compara promedios.
+    divide el segmento en bins seg�n t_coord y compara promedios.
     """
     device = pred.device
     edges = torch.linspace(0.0, 1.0, num_bins + 1, device=device)
@@ -281,10 +280,8 @@ class StableTubeAwareTUSLoss(nn.Module):
         self.eps = float(eps)
 
     def get_schedule(self, epoch: int):
-        r_tube = ramp_linear(epoch, self.tube_warmup_start,
-                             self.tube_warmup_end)
-        r_profile = ramp_linear(
-            epoch, self.profile_warmup_start, self.profile_warmup_end)
+        r_tube = ramp_linear(epoch, self.tube_warmup_start, self.tube_warmup_end)
+        r_profile = ramp_linear(epoch, self.profile_warmup_start, self.profile_warmup_end)
 
         return {
             "r_tube": r_tube,
@@ -309,26 +306,21 @@ class StableTubeAwareTUSLoss(nn.Module):
         )
 
         rel = (target32 / peak).clamp(0.0, 1.0)
-        w_global = 1.0 + self.global_peak_weight * \
-            rel.pow(self.global_peak_gamma)
+        w_global = 1.0 + self.global_peak_weight * rel.pow(self.global_peak_gamma)
         loss_global = (torch.abs(pred_pos - target32) * w_global).mean()
 
-        focus_num = masked_mean(
-            (pred_pos - target32).pow(2), focus_roi, eps=self.eps)
-        focus_den = masked_mean(target32.pow(
-            2), focus_roi, eps=self.eps).clamp_min(self.eps)
+        focus_num = masked_mean((pred_pos - target32).pow(2), focus_roi, eps=self.eps)
+        focus_den = masked_mean(target32.pow(2), focus_roi, eps=self.eps).clamp_min(self.eps)
         loss_focus = focus_num / focus_den
 
         pdx, pdy, pdz = grad3d(pred_pos)
         tdx, tdy, tdz = grad3d(target32)
 
-        grad_diff = torch.abs(pdx - tdx) + \
-            torch.abs(pdy - tdy) + torch.abs(pdz - tdz)
+        grad_diff = torch.abs(pdx - tdx) + torch.abs(pdy - tdy) + torch.abs(pdz - tdz)
         grad_ref = torch.abs(tdx) + torch.abs(tdy) + torch.abs(tdz)
 
         grad_num = masked_mean(grad_diff, focus_roi, eps=self.eps)
-        grad_den = masked_mean(grad_ref, focus_roi,
-                               eps=self.eps).clamp_min(self.eps)
+        grad_den = masked_mean(grad_ref, focus_roi, eps=self.eps).clamp_min(self.eps)
         loss_grad = grad_num / grad_den
 
         tube_roi, t_coord, _, _ = build_tube_roi_and_tcoord(
@@ -338,14 +330,11 @@ class StableTubeAwareTUSLoss(nn.Module):
         )
 
         if sched["lambda_tube_eff"] > 0.0:
-            tube_num = masked_mean(
-                (pred_pos - target32).pow(2), tube_roi, eps=self.eps)
-            tube_den = masked_mean(target32.pow(
-                2), tube_roi, eps=self.eps).clamp_min(self.eps)
+            tube_num = masked_mean((pred_pos - target32).pow(2), tube_roi, eps=self.eps)
+            tube_den = masked_mean(target32.pow(2), tube_roi, eps=self.eps).clamp_min(self.eps)
             loss_tube = tube_num / tube_den
         else:
-            loss_tube = torch.zeros(
-                (), device=pred.device, dtype=torch.float32)
+            loss_tube = torch.zeros((), device=pred.device, dtype=torch.float32)
 
         if sched["lambda_profile_eff"] > 0.0:
             loss_profile = compute_profile_loss(
@@ -357,8 +346,7 @@ class StableTubeAwareTUSLoss(nn.Module):
                 eps=self.eps
             )
         else:
-            loss_profile = torch.zeros(
-                (), device=pred.device, dtype=torch.float32)
+            loss_profile = torch.zeros((), device=pred.device, dtype=torch.float32)
 
         total = (
             self.lambda_global * loss_global
@@ -387,7 +375,7 @@ class StableTubeAwareTUSLoss(nn.Module):
 
 
 # =========================================================
-# Métricas extra en VALIDATION
+# M�tricas extra en VALIDATION
 # =========================================================
 def make_brain_mask_from_skull(skull_mask_3d: np.ndarray) -> np.ndarray:
     skull = skull_mask_3d > 0.5
@@ -440,7 +428,6 @@ def eval_extra_metrics(G, loader, device, dx_mm=0.5, use_amp=True):
         pred_np = pred.detach().float().cpu().squeeze().numpy()
         gt_np = y.detach().float().cpu().squeeze().numpy()
 
-        # Asume X = [source_mask, skull_mask]
         x_np = X.detach().float().cpu().squeeze(0).numpy()
         if x_np.ndim == 4 and x_np.shape[0] >= 2:
             skull_np = x_np[1]
@@ -472,8 +459,7 @@ def eval_extra_metrics(G, loader, device, dx_mm=0.5, use_amp=True):
         dice50 = dice_coeff(pr_mask50, gt_mask50)
 
         brain_sel = brain_mask > 0
-        mse_brain = float(((pred_np - gt_np) ** 2)
-                          [brain_sel].mean()) if brain_sel.any() else float("nan")
+        mse_brain = float(((pred_np - gt_np) ** 2)[brain_sel].mean()) if brain_sel.any() else float("nan")
 
         sums["peak_rel_err"] += peak_rel_err
         sums["peak_loc_err_mm"] += peak_loc_err_mm
@@ -527,8 +513,7 @@ class VisualCallback:
 
             self.samples.append((int(idx), x.clone().cpu(), y.clone().cpu()))
 
-        print(
-            f"VisualCallback activo con casos fijos: {[s[0] for s in self.samples]}")
+        print(f"VisualCallback activo con casos fijos: {[s[0] for s in self.samples]}")
 
     def should_run(self, epoch: int) -> bool:
         return self.every_n_epochs > 0 and epoch % self.every_n_epochs == 0
@@ -593,18 +578,15 @@ class VisualCallback:
         vmax_err = max(float(err.max()), 1e-8)
 
         for r, (name, g, p, e) in enumerate(rows):
-            axes[r, 0].imshow(g, cmap="jet", origin="lower",
-                              vmin=0, vmax=vmax_main)
+            axes[r, 0].imshow(g, cmap="jet", origin="lower", vmin=0, vmax=vmax_main)
             axes[r, 0].set_title(f"{name} | GT")
             axes[r, 0].axis("off")
 
-            axes[r, 1].imshow(p, cmap="jet", origin="lower",
-                              vmin=0, vmax=vmax_main)
+            axes[r, 1].imshow(p, cmap="jet", origin="lower", vmin=0, vmax=vmax_main)
             axes[r, 1].set_title(f"{name} | Pred")
             axes[r, 1].axis("off")
 
-            axes[r, 2].imshow(e, cmap="magma", origin="lower",
-                              vmin=0, vmax=vmax_err)
+            axes[r, 2].imshow(e, cmap="magma", origin="lower", vmin=0, vmax=vmax_err)
             axes[r, 2].set_title(f"{name} | |Error|")
             axes[r, 2].axis("off")
 
@@ -651,8 +633,7 @@ class VisualCallback:
             else nullcontext()
         )
 
-        print(
-            f"Guardando visualizaciones de validación en epoch {epoch:03d}...")
+        print(f"Guardando visualizaciones de validaci�n en epoch {epoch:03d}...")
 
         for case_idx, x_cpu, y_cpu in self.samples:
             X = x_cpu.unsqueeze(0).to(self.device, non_blocking=True)
@@ -663,8 +644,7 @@ class VisualCallback:
             pred_np = self._to_numpy_3d(pred.clamp_min(0.0))
             gt_np = self._to_numpy_3d(y_cpu)
 
-            fig, raw_payload = self._build_case_figure(
-                pred_np, gt_np, epoch, case_idx)
+            fig, raw_payload = self._build_case_figure(pred_np, gt_np, epoch, case_idx)
 
             case_dir = os.path.join(self.out_dir, f"case_{case_idx:03d}")
             os.makedirs(case_dir, exist_ok=True)
@@ -673,8 +653,7 @@ class VisualCallback:
             fig.savefig(out_png, dpi=160, bbox_inches="tight")
 
             if self.writer is not None:
-                self.writer.add_figure(
-                    f"visuals/case_{case_idx:03d}", fig, global_step=epoch)
+                self.writer.add_figure(f"visuals/case_{case_idx:03d}", fig, global_step=epoch)
 
             plt.close(fig)
 
@@ -699,8 +678,7 @@ def adv_weight_schedule(epoch: int,
     if epoch >= ramp_end_epoch:
         return float(end_value)
 
-    alpha = float(epoch - start_epoch) / \
-        float(max(1, ramp_end_epoch - start_epoch))
+    alpha = float(epoch - start_epoch) / float(max(1, ramp_end_epoch - start_epoch))
     return float((1.0 - alpha) * start_value + alpha * end_value)
 
 
@@ -831,14 +809,10 @@ def log_epoch_to_tensorboard(writer: SummaryWriter,
     writer.add_scalar("recon/val_tube", val_stats["loss_tube"], epoch)
     writer.add_scalar("recon/val_profile", val_stats["loss_profile"], epoch)
 
-    writer.add_scalar("scores/train_D_real_mean",
-                      train_stats["d_real_mean"], epoch)
-    writer.add_scalar("scores/train_D_fake_mean",
-                      train_stats["d_fake_mean"], epoch)
-    writer.add_scalar("scores/val_D_real_mean",
-                      val_stats["d_real_mean"], epoch)
-    writer.add_scalar("scores/val_D_fake_mean",
-                      val_stats["d_fake_mean"], epoch)
+    writer.add_scalar("scores/train_D_real_mean", train_stats["d_real_mean"], epoch)
+    writer.add_scalar("scores/train_D_fake_mean", train_stats["d_fake_mean"], epoch)
+    writer.add_scalar("scores/val_D_real_mean", val_stats["d_real_mean"], epoch)
+    writer.add_scalar("scores/val_D_fake_mean", val_stats["d_fake_mean"], epoch)
 
     writer.add_scalar("schedule/lambda_adv", lambda_adv, epoch)
     writer.add_scalar("optim/lr_G", lr_G, epoch)
@@ -865,7 +839,8 @@ def train_one_epoch(G, D,
                     lambda_adv: float,
                     grad_clip_G: float = 2.0,
                     grad_clip_D: float = 1.0,
-                    use_amp: bool = True) -> Dict[str, float]:
+                    use_amp: bool = True,
+                    d_update_every: int = 2) -> Dict[str, float]:
     G.train()
     D.train()
 
@@ -891,44 +866,63 @@ def train_one_epoch(G, D,
         )
 
         # -------------------------
-        # A) Train D
+        # A) Train D (solo cada d_update_every steps)
         # -------------------------
-        optim_D.zero_grad(set_to_none=True)
+        update_D = ((step - 1) % d_update_every == 0)
 
-        with torch.no_grad():
+        if update_D:
+            optim_D.zero_grad(set_to_none=True)
+
+            with torch.no_grad():
+                with amp_ctx:
+                    y_hat_det = G(X)
+
             with amp_ctx:
-                y_hat_det = G(X)
+                pred_real = D(X, y)
+                pred_fake = D(X, y_hat_det)
 
-        with amp_ctx:
-            pred_real = D(X, y)
-            pred_fake = D(X, y_hat_det)
+                loss_d_real = adv_criterion(pred_real, torch.ones_like(pred_real))
+                loss_d_fake = adv_criterion(pred_fake, torch.zeros_like(pred_fake))
+                loss_d = 0.5 * (loss_d_real + loss_d_fake)
 
-            loss_d_real = adv_criterion(pred_real, torch.ones_like(pred_real))
-            loss_d_fake = adv_criterion(pred_fake, torch.zeros_like(pred_fake))
-            loss_d = 0.5 * (loss_d_real + loss_d_fake)
+            if not torch.isfinite(loss_d):
+                print(f"[WARN] Non-finite loss_D at epoch={epoch}, step={step}. Batch skipped.")
+                continue
 
-        if not torch.isfinite(loss_d):
-            print(
-                f"[WARN] Non-finite loss_D at epoch={epoch}, step={step}. Batch skipped.")
-            continue
+            if device == "cuda" and use_amp:
+                scaler_D.scale(loss_d).backward()
+                scaler_D.unscale_(optim_D)
+                if grad_clip_D is not None and grad_clip_D > 0:
+                    torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=float(grad_clip_D))
+                scaler_D.step(optim_D)
+                scaler_D.update()
+            else:
+                loss_d.backward()
+                if grad_clip_D is not None and grad_clip_D > 0:
+                    torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=float(grad_clip_D))
+                optim_D.step()
 
-        if device == "cuda" and use_amp:
-            scaler_D.scale(loss_d).backward()
-            scaler_D.unscale_(optim_D)
-            if grad_clip_D is not None and grad_clip_D > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    D.parameters(), max_norm=float(grad_clip_D))
-            scaler_D.step(optim_D)
-            scaler_D.update()
+            d_total_item = float(loss_d.item())
+            d_real_item = float(pred_real.detach().mean().item())
+            d_fake_item = float(pred_fake.detach().mean().item())
+
         else:
-            loss_d.backward()
-            if grad_clip_D is not None and grad_clip_D > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    D.parameters(), max_norm=float(grad_clip_D))
-            optim_D.step()
+            with torch.no_grad():
+                with amp_ctx:
+                    y_hat_det = G(X)
+                    pred_real = D(X, y)
+                    pred_fake = D(X, y_hat_det)
+
+                    loss_d_real = adv_criterion(pred_real, torch.ones_like(pred_real))
+                    loss_d_fake = adv_criterion(pred_fake, torch.zeros_like(pred_fake))
+                    loss_d = 0.5 * (loss_d_real + loss_d_fake)
+
+            d_total_item = float(loss_d.item())
+            d_real_item = float(pred_real.detach().mean().item())
+            d_fake_item = float(pred_fake.detach().mean().item())
 
         # -------------------------
-        # B) Train G
+        # B) Train G (siempre)
         # -------------------------
         optim_G.zero_grad(set_to_none=True)
 
@@ -943,36 +937,32 @@ def train_one_epoch(G, D,
             )
 
             pred_fake_for_g = D(X, y_hat)
-            loss_adv_g = adv_criterion(
-                pred_fake_for_g, torch.ones_like(pred_fake_for_g))
+            loss_adv_g = adv_criterion(pred_fake_for_g, torch.ones_like(pred_fake_for_g))
             loss_g = loss_recon + lambda_adv * loss_adv_g
 
         if not torch.isfinite(loss_g):
-            print(
-                f"[WARN] Non-finite loss_G at epoch={epoch}, step={step}. Batch skipped.")
+            print(f"[WARN] Non-finite loss_G at epoch={epoch}, step={step}. Batch skipped.")
             continue
 
         if device == "cuda" and use_amp:
             scaler_G.scale(loss_g).backward()
             scaler_G.unscale_(optim_G)
             if grad_clip_G is not None and grad_clip_G > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    G.parameters(), max_norm=float(grad_clip_G))
+                torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=float(grad_clip_G))
             scaler_G.step(optim_G)
             scaler_G.update()
         else:
             loss_g.backward()
             if grad_clip_G is not None and grad_clip_G > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    G.parameters(), max_norm=float(grad_clip_G))
+                torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=float(grad_clip_G))
             optim_G.step()
 
         sums["g_total"] += float(loss_g.item())
         sums["g_recon"] += float(loss_recon.item())
         sums["g_adv"] += float(loss_adv_g.item())
-        sums["d_total"] += float(loss_d.item())
-        sums["d_real_mean"] += float(pred_real.detach().mean().item())
-        sums["d_fake_mean"] += float(pred_fake.detach().mean().item())
+        sums["d_total"] += d_total_item
+        sums["d_real_mean"] += d_real_item
+        sums["d_fake_mean"] += d_fake_item
         n_batches += 1
 
     if n_batches == 0:
@@ -1028,8 +1018,7 @@ def eval_one_epoch(G, D,
             )
 
             pred_fake_for_g = D(X, y_hat)
-            loss_adv_g = adv_criterion(
-                pred_fake_for_g, torch.ones_like(pred_fake_for_g))
+            loss_adv_g = adv_criterion(pred_fake_for_g, torch.ones_like(pred_fake_for_g))
             loss_g = loss_recon + lambda_adv * loss_adv_g
 
             pred_real = D(X, y)
@@ -1039,8 +1028,7 @@ def eval_one_epoch(G, D,
             loss_d = 0.5 * (loss_d_real + loss_d_fake)
 
         if (not torch.isfinite(loss_g)) or (not torch.isfinite(loss_d)):
-            print(
-                f"[WARN] Non-finite validation loss at epoch={epoch}. Batch skipped.")
+            print(f"[WARN] Non-finite validation loss at epoch={epoch}. Batch skipped.")
             continue
 
         sums["g_total"] += float(loss_g.item())
@@ -1071,13 +1059,12 @@ def main():
     # =========================
     SEED = 123
 
-    SAVE_DIR = "checkpoints_cgan_exp04_300epoch"
+    SAVE_DIR = "checkpoints_cgan_exp02_D_every2"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
-    VAL_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
-    # no se usa durante train
-    TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
+    VAL_DIR   = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/val"
+    TEST_DIR  = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"  # no se usa durante train
 
     CSV_PATH = os.path.join(SAVE_DIR, "training_log.csv")
     TB_DIR = os.path.join(SAVE_DIR, "tensorboard")
@@ -1086,7 +1073,7 @@ def main():
     NUM_WORKERS = 2
     PIN_MEMORY = True
 
-    EPOCHS = 300
+    EPOCHS = 100
     LR_G = 1e-4
     LR_D = 5e-5
     WEIGHT_DECAY_G = 1e-4
@@ -1110,6 +1097,9 @@ def main():
     ADV_RAMP_END_EPOCH = 15
     ADV_START_VALUE = 1e-3
     ADV_END_VALUE = 1e-2
+
+    # frecuencia de actualizaci�n de D
+    D_UPDATE_EVERY = 2
 
     # metrics / visuals cadence
     EXTRA_METRICS_EVERY_N_EPOCHS = 10
@@ -1140,8 +1130,8 @@ def main():
     # DATA
     # =========================
     train_ds = TusDataset(TRAIN_DIR)
-    val_ds = TusDataset(VAL_DIR)
-    test_ds = TusDataset(TEST_DIR)
+    val_ds   = TusDataset(VAL_DIR)
+    test_ds  = TusDataset(TEST_DIR)
 
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
@@ -1155,7 +1145,7 @@ def main():
 
     val_loader = make_loader(
         dataset=val_ds,
-        batch_size=2,
+        batch_size=1,
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=PIN_MEMORY,
@@ -1174,7 +1164,7 @@ def main():
     ).to(device)
 
     D = PatchDiscriminator3D(
-        in_ch=3,   # 2 canales de X + 1 canal del campo
+        in_ch=3,
         base=BASE_D
     ).to(device)
 
@@ -1230,7 +1220,6 @@ def main():
         eps=1e-6,
     )
 
-    # LSGAN
     adv_criterion = nn.MSELoss()
 
     # =========================
@@ -1266,6 +1255,7 @@ def main():
             "ADV_START_VALUE": ADV_START_VALUE,
             "ADV_END_VALUE": ADV_END_VALUE,
         },
+        "D_UPDATE_EVERY": D_UPDATE_EVERY,
         "LOSS": {
             "lambda_global": 0.8,
             "lambda_focus": 1.5,
@@ -1325,7 +1315,8 @@ def main():
                 lambda_adv=lambda_adv,
                 grad_clip_G=2.0,
                 grad_clip_D=1.0,
-                use_amp=USE_AMP
+                use_amp=USE_AMP,
+                d_update_every=D_UPDATE_EVERY
             )
 
             val_stats = eval_one_epoch(
