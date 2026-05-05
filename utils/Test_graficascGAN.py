@@ -3,6 +3,10 @@ import glob
 import random
 import numpy as np
 import torch
+import matplotlib
+
+matplotlib.use("Agg")  # �til en servidores sin interfaz gr�fica
+
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from scipy.ndimage import binary_fill_holes
@@ -14,18 +18,27 @@ from src.modelos.ResUnet3D import ResUNet3D_HQ
 # CONFIG
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
-CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/epoch_030.pth"
-OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/tablas/visualsbestmodels"
+
+# Cambia entre best.pth, last.pth o epoch_xxx.pth
+CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp04_300epoch/epoch_290.pth"
+
+OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/tablas/visualscGAN300"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DX_MM = 1.0
 
 NUM_WORKERS = 0
-PIN_MEMORY = True
+PIN_MEMORY = True if DEVICE == "cuda" else False
 
 # Casos a visualizar
 N_RANDOM_CASES = 5
-FORCE_FILES = set()   # ej: {"sample_0012.npz", "sample_0456.npz"}
+FIXED_RANDOM_SEED = 42
+
+# Si quieres forzar casos concretos, ponlos aqu�.
+# Si est� vac�o, el script escoge siempre los mismos 5 no-water usando seed.
+FORCE_FILES = set()
+# Ejemplo:
+# FORCE_FILES = {"sample_0012.npz", "sample_0456.npz"}
 
 # Scatter
 SCATTER_THR = 0.01
@@ -35,7 +48,6 @@ SCATTER_MAX_POINTS = 50000
 PROFILE_SAMPLES = 256
 
 os.makedirs(OUT_DIR, exist_ok=True)
-
 
 
 # =========================================================
@@ -58,7 +70,7 @@ def reconstruct_brain_mask(mask_skull: np.ndarray, is_water_only: bool) -> np.nd
 class TusTestDataset(Dataset):
     """
     Espera en cada .npz:
-      - water_only o is_water_only
+      - is_water_only o water_only
       - mask_skull
       - p_max_norm
       - source_mask
@@ -91,7 +103,9 @@ class TusTestDataset(Dataset):
             elif "water_only" in d:
                 is_water_only = bool(np.array(d["water_only"]).item())
             else:
-                raise RuntimeError(f"{os.path.basename(path)} no contiene water_only ni is_water_only")
+                raise RuntimeError(
+                    f"{os.path.basename(path)} no contiene is_water_only ni water_only"
+                )
 
         for name, arr in [
             ("source_mask", src),
@@ -100,12 +114,13 @@ class TusTestDataset(Dataset):
         ]:
             if arr.shape != self.expected_shape:
                 raise RuntimeError(
-                    f"Shape inválida en {os.path.basename(path)} | "
+                    f"Shape inv�lida en {os.path.basename(path)} | "
                     f"{name}: {arr.shape} | esperado: {self.expected_shape}"
                 )
 
         brain = reconstruct_brain_mask(skull, is_water_only)
 
+        # Entrada de tu cGAN: [source_mask, skull_mask]
         X = np.stack([src, skull], axis=0)   # [2, D, H, W]
         y = y[np.newaxis, ...]               # [1, D, H, W]
         brain = brain[np.newaxis, ...]       # [1, D, H, W]
@@ -122,7 +137,69 @@ class TusTestDataset(Dataset):
 
 
 # =========================================================
-# MODEL
+# FIXED NON-WATER CASE SELECTION
+# =========================================================
+def read_is_water_only(path: str) -> bool:
+    with np.load(path) as d:
+        if "is_water_only" in d:
+            return bool(np.array(d["is_water_only"]).item())
+        elif "water_only" in d:
+            return bool(np.array(d["water_only"]).item())
+        else:
+            raise RuntimeError(
+                f"{os.path.basename(path)} no contiene is_water_only ni water_only"
+            )
+
+
+def select_fixed_random_non_water_cases(dataset, n_cases=5, seed=42):
+    """
+    Selecciona siempre los mismos n_cases no-water de forma pseudoaleatoria.
+    Mientras no cambie la carpeta test, los 5 casos ser�n siempre los mismos.
+    """
+    valid_files = []
+
+    for path in dataset.files:
+        is_water_only = read_is_water_only(path)
+
+        if not is_water_only:
+            valid_files.append(os.path.basename(path))
+
+    if len(valid_files) < n_cases:
+        raise RuntimeError(
+            f"Solo se encontraron {len(valid_files)} casos no-water, "
+            f"pero pediste {n_cases}."
+        )
+
+    rng = random.Random(seed)
+    selected = rng.sample(valid_files, n_cases)
+
+    return set(selected)
+
+
+def validate_force_files(dataset, force_files):
+    """
+    Comprueba que los FORCE_FILES existan y que no sean water-only.
+    """
+    if not force_files:
+        return
+
+    available = {os.path.basename(p): p for p in dataset.files}
+
+    for fname in force_files:
+        if fname not in available:
+            raise RuntimeError(
+                f"FORCE_FILE no encontrado en TEST_DIR: {fname}"
+            )
+
+        is_water_only = read_is_water_only(available[fname])
+        if is_water_only:
+            raise RuntimeError(
+                f"FORCE_FILE es water-only y no deber�a usarse: {fname}"
+            )
+
+
+# =========================================================
+# MODEL / CGAN GENERATOR
 # =========================================================
 def load_model(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -136,7 +213,27 @@ def load_model(ckpt_path: str, device: str):
         out_positive=True,
     ).to(device)
 
-    model.load_state_dict(ckpt["model"], strict=True)
+    # Compatible con checkpoints de cGAN y U-Net.
+    # Para cGAN se usa SOLO el Generator G.
+    if isinstance(ckpt, dict) and "G" in ckpt:
+        print("Cargando GENERATOR G desde checkpoint cGAN")
+        model.load_state_dict(ckpt["G"], strict=True)
+
+    elif isinstance(ckpt, dict) and "model" in ckpt:
+        print("Cargando modelo desde checkpoint U-Net")
+        model.load_state_dict(ckpt["model"], strict=True)
+
+    else:
+        if isinstance(ckpt, dict):
+            keys = list(ckpt.keys())
+        else:
+            keys = type(ckpt)
+
+        raise KeyError(
+            f"No se encontr� ni 'G' ni 'model' en el checkpoint: {ckpt_path}. "
+            f"Keys disponibles: {keys}"
+        )
+
     model.eval()
     return model
 
@@ -144,35 +241,6 @@ def load_model(ckpt_path: str, device: str):
 # =========================================================
 # HELPERS
 # =========================================================
-def select_fixed_random_non_water_cases(dataset, n_cases=5, seed=42):
-    """
-    Selecciona n_cases no-water de forma pseudoaleatoria pero reproducible.
-    """
-    valid_files = []
-
-    for path in dataset.files:
-        with np.load(path) as d:
-            if "is_water_only" in d:
-                is_water_only = bool(np.array(d["is_water_only"]).item())
-            elif "water_only" in d:
-                is_water_only = bool(np.array(d["water_only"]).item())
-            else:
-                raise RuntimeError(
-                    f"{os.path.basename(path)} no contiene water_only ni is_water_only"
-                )
-
-        if not is_water_only:
-            valid_files.append(os.path.basename(path))
-
-    if len(valid_files) < n_cases:
-        raise RuntimeError(
-            f"Solo se encontraron {len(valid_files)} casos no-water, pero pediste {n_cases}."
-        )
-
-    rng = random.Random(seed)
-    selected = rng.sample(valid_files, n_cases)
-    return set(selected)
-
 def get_peak_index_masked(vol: np.ndarray, mask: np.ndarray):
     masked = np.where(mask > 0, vol, -np.inf)
     flat_idx = int(np.argmax(masked))
@@ -183,7 +251,7 @@ def get_source_centroid(source_mask: np.ndarray):
     coords = np.argwhere(source_mask > 0.5)
     if len(coords) == 0:
         return None
-    return coords.mean(axis=0).astype(np.float32)  # z,y,x
+    return coords.mean(axis=0).astype(np.float32)  # z, y, x
 
 
 def sample_line_trilinear(vol, p0, p1, n=256):
@@ -241,6 +309,7 @@ def plot_scatter_gt_vs_pred(gt, pred, brain_mask, save_path, thr=0.01, max_point
     pred_vals = pred[mask]
 
     if len(gt_vals) == 0:
+        print(f"[WARN] Scatter vac�o, no se guarda: {save_path}")
         return
 
     if len(gt_vals) > max_points:
@@ -253,6 +322,7 @@ def plot_scatter_gt_vs_pred(gt, pred, brain_mask, save_path, thr=0.01, max_point
 
     min_val = min(float(gt_vals.min()), float(pred_vals.min()))
     max_val = max(float(gt_vals.max()), float(pred_vals.max()))
+
     plt.plot([min_val, max_val], [min_val, max_val], "r--", linewidth=1)
 
     plt.xlabel("Ground truth")
@@ -309,9 +379,17 @@ def plot_axis_profiles(gt, pred, brain_mask, save_path, dx_mm=1.0):
     plt.close()
 
 
-def plot_source_centroid_to_peak_profile(gt, pred, source_mask, brain_mask, save_path, n_samples=256):
+def plot_source_centroid_to_peak_profile(
+    gt,
+    pred,
+    source_mask,
+    brain_mask,
+    save_path,
+    n_samples=256
+):
     src_centroid = get_source_centroid(source_mask)
     if src_centroid is None:
+        print(f"[WARN] Source centroid no encontrado, no se guarda: {save_path}")
         return
 
     gt_peak = np.array(get_peak_index_masked(gt, brain_mask), dtype=np.float32)
@@ -319,10 +397,10 @@ def plot_source_centroid_to_peak_profile(gt, pred, source_mask, brain_mask, save
     prof_gt = sample_line_trilinear(gt, src_centroid, gt_peak, n=n_samples)
     prof_pr = sample_line_trilinear(pred, src_centroid, gt_peak, n=n_samples)
 
-    fig = plt.figure(figsize=(7, 4))
+    plt.figure(figsize=(7, 4))
     plt.plot(prof_gt, label="GT")
     plt.plot(prof_pr, label="Pred")
-    plt.title("Approx. profile: source-mask centroid → GT brain peak")
+    plt.title("Approx. profile: source-mask centroid � GT brain peak")
     plt.xlabel("Samples along line")
     plt.ylabel("p_max_norm")
     plt.grid(True, alpha=0.25)
@@ -351,17 +429,28 @@ def plot_triplet(gt, pred, brain_mask, save_path):
     vmin = 0.0
     vmax = float(gt.max())
 
+    if vmax <= 0:
+        vmax = 1.0
+
     fig, axes = plt.subplots(3, 3, figsize=(12, 12))
-    rows = [("GT", [gt_sag, gt_cor, gt_ax]), ("Pred", [pr_sag, pr_cor, pr_ax]), ("|Error|", [er_sag, er_cor, er_ax])]
+
+    rows = [
+        ("GT", [gt_sag, gt_cor, gt_ax]),
+        ("Pred", [pr_sag, pr_cor, pr_ax]),
+        ("|Error|", [er_sag, er_cor, er_ax]),
+    ]
+
     cols = ["Sagittal", "Coronal", "Axial"]
 
     for i, (row_name, imgs) in enumerate(rows):
         for j, img in enumerate(imgs):
             ax = axes[i, j]
+
             if row_name == "|Error|":
                 im = ax.imshow(img.T, origin="lower", cmap="jet")
             else:
                 im = ax.imshow(img.T, origin="lower", cmap="jet", vmin=vmin, vmax=vmax)
+
             ax.set_title(f"{row_name} - {cols[j]}")
             ax.axis("off")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -380,26 +469,30 @@ def main():
     print("TEST_DIR:", TEST_DIR)
     print("CKPT_PATH:", CKPT_PATH)
     print("OUT_DIR:", OUT_DIR)
+    print("DX_MM:", DX_MM)
 
-    # 1) Primero se crea el dataset
+    # 1) Crear dataset
     test_ds = TusTestDataset(TEST_DIR)
 
-    # 2) Después se seleccionan los 5 casos fijos no-water
+    # 2) Seleccionar siempre los mismos 5 casos no-water
+    validate_force_files(test_ds, FORCE_FILES)
+
     if FORCE_FILES:
         vis_files = set(FORCE_FILES)
     else:
         vis_files = select_fixed_random_non_water_cases(
-        test_ds,
-        n_cases=N_RANDOM_CASES,
-        seed=42
-    )
-    print("Casos seleccionados para visualización:")
+            test_ds,
+            n_cases=N_RANDOM_CASES,
+            seed=FIXED_RANDOM_SEED,
+        )
+
+    print("\nCasos seleccionados para visualizaci�n:")
     for f in sorted(vis_files):
         print(" -", f)
 
-    print(f"Se visualizarán {len(vis_files)} casos.")
+    print(f"\nSe visualizar�n {len(vis_files)} casos.")
 
-    # 3) Luego se crea el DataLoader
+    # 3) Crear DataLoader
     test_loader = DataLoader(
         test_ds,
         batch_size=1,
@@ -408,18 +501,24 @@ def main():
         pin_memory=PIN_MEMORY,
     )
 
-    # 4) Finalmente se carga el modelo
+    # 4) Cargar modelo/generator
     model = load_model(CKPT_PATH, DEVICE)
 
+    # 5) Inferencia y visualizaci�n
     for batch in test_loader:
         X = batch["X"].to(DEVICE, non_blocking=True)
         y = batch["y"].to(DEVICE, non_blocking=True)
         brain = batch["brain_mask"].to(DEVICE, non_blocking=True)
         src = batch["source_mask"].to(DEVICE, non_blocking=True)
+
         is_water_only = bool(batch["is_water_only"][0])
         file_name = batch["file_name"][0]
 
         if file_name not in vis_files:
+            continue
+
+        if is_water_only:
+            print(f"[SKIP] {file_name} es water-only.")
             continue
 
         pred = model(X).clamp_min(0.0)
@@ -429,14 +528,15 @@ def main():
         brain_np = brain[0, 0].detach().cpu().numpy().astype(np.float32)
         src_np = src[0, 0].detach().cpu().numpy().astype(np.float32)
 
-        if is_water_only or brain_np.sum() == 0:
-            print(f"[SKIP] {file_name} es water-only o no tiene brain mask útil.")
+        if brain_np.sum() == 0:
+            print(f"[SKIP] {file_name} no tiene brain mask �til.")
             continue
 
         base = os.path.splitext(file_name)[0]
         case_dir = os.path.join(OUT_DIR, base)
         os.makedirs(case_dir, exist_ok=True)
 
+        # 0) Slices GT / Pred / Error
         plot_triplet(
             gt=gt_np,
             pred=pred_np,
@@ -444,6 +544,7 @@ def main():
             save_path=os.path.join(case_dir, f"{base}_triplet.png"),
         )
 
+        # 1) Scatter GT vs Pred
         plot_scatter_gt_vs_pred(
             gt=gt_np,
             pred=pred_np,
@@ -453,6 +554,7 @@ def main():
             max_points=SCATTER_MAX_POINTS,
         )
 
+        # 2) Perfiles X/Y/Z en el pico GT cerebral
         plot_axis_profiles(
             gt=gt_np,
             pred=pred_np,
@@ -461,6 +563,7 @@ def main():
             dx_mm=DX_MM,
         )
 
+        # 3) Perfil aproximado centroide source_mask -> pico GT cerebral
         plot_source_centroid_to_peak_profile(
             gt=gt_np,
             pred=pred_np,

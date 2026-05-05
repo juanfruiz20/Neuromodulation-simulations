@@ -11,6 +11,7 @@ from scipy.ndimage import binary_fill_holes
 
 from src.modelos.ResUnet3D import ResUNet3D_HQ
 
+
 # =========================================================
 # SSIM opcional
 # =========================================================
@@ -30,13 +31,17 @@ except ImportError:
 # CONFIG
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp03_lrdhalf_300epoch"
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp04_300epoch"
 OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Si el dataset se gener� con dx=1 mm, d�jalo en 1.0
 DX_MM = 1.0
+
+# N�mero de puntos para el perfil:
+# source centroid -> GT peak -> volume boundary
+PROFILE_SAMPLES = 256
 
 NUM_WORKERS = 0
 PIN_MEMORY = True
@@ -64,6 +69,7 @@ def discover_checkpoints(ckpt_dir: str) -> List[str]:
         if n not in seen:
             out.append(n)
             seen.add(n)
+
     return out
 
 
@@ -81,6 +87,7 @@ def reconstruct_brain_mask(mask_skull: np.ndarray, is_water_only: bool) -> np.nd
 
     filled = binary_fill_holes(skull)
     brain = np.logical_and(filled, np.logical_not(skull))
+
     return brain.astype(np.float32)
 
 
@@ -105,8 +112,7 @@ class TusTestDataset(Dataset):
         self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
         if len(self.files) == 0:
-            raise RuntimeError(
-                f"No se encontraron archivos .npz en: {data_dir}")
+            raise RuntimeError(f"No se encontraron archivos .npz en: {data_dir}")
 
     def __len__(self):
         return len(self.files)
@@ -118,7 +124,15 @@ class TusTestDataset(Dataset):
             src = d["source_mask"].astype(np.float32)
             skull = d["mask_skull"].astype(np.float32)
             y = d["p_max_norm"].astype(np.float32)
-            is_water_only = bool(np.array(d["is_water_only"]).item())
+
+            if "is_water_only" in d:
+                is_water_only = bool(np.array(d["is_water_only"]).item())
+            elif "water_only" in d:
+                is_water_only = bool(np.array(d["water_only"]).item())
+            else:
+                raise RuntimeError(
+                    f"{os.path.basename(path)} no contiene is_water_only ni water_only"
+                )
 
         for name, arr in [
             ("source_mask", src),
@@ -136,18 +150,20 @@ class TusTestDataset(Dataset):
         X = np.stack([src, skull], axis=0)   # [2, D, H, W]
         y = y[np.newaxis, ...]               # [1, D, H, W]
         brain = brain[np.newaxis, ...]       # [1, D, H, W]
+        src = src[np.newaxis, ...]           # [1, D, H, W]
 
         return {
             "X": torch.from_numpy(X),
             "y": torch.from_numpy(y),
             "brain_mask": torch.from_numpy(brain),
+            "source_mask": torch.from_numpy(src),
             "is_water_only": is_water_only,
             "file_name": os.path.basename(path),
         }
 
 
 # =========================================================
-# HELPERS
+# MODEL LOADING
 # =========================================================
 def load_model(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -162,34 +178,56 @@ def load_model(ckpt_path: str, device: str):
     ).to(device)
 
     # Compatible con checkpoints antiguos de U-Net y nuevos de cGAN
-    if "G" in ckpt:
+    if isinstance(ckpt, dict) and "G" in ckpt:
         print("Cargando generador G desde checkpoint cGAN")
         model.load_state_dict(ckpt["G"], strict=True)
-    elif "model" in ckpt:
+
+    elif isinstance(ckpt, dict) and "model" in ckpt:
         print("Cargando modelo desde checkpoint U-Net")
         model.load_state_dict(ckpt["model"], strict=True)
+
     else:
+        keys = list(ckpt.keys()) if isinstance(ckpt, dict) else type(ckpt)
         raise KeyError(
-            f"No se encontró ni 'G' ni 'model' en el checkpoint: {ckpt_path}. "
-            f"Keys disponibles: {list(ckpt.keys())}"
+            f"No se encontr� ni 'G' ni 'model' en el checkpoint: {ckpt_path}. "
+            f"Keys disponibles: {keys}"
         )
 
     model.eval()
     return model, ckpt
 
 
+# =========================================================
+# HELPERS
+# =========================================================
 def get_peak_index_masked(vol: np.ndarray, mask: np.ndarray) -> Tuple[int, int, int]:
     masked = np.where(mask > 0, vol, -np.inf)
     flat_idx = int(np.argmax(masked))
     return np.unravel_index(flat_idx, vol.shape)
 
 
+def get_source_centroid(source_mask: np.ndarray):
+    """
+    Calcula el centroide de la source_mask.
+    Devuelve coordenadas [z, y, x].
+    """
+    coords = np.argwhere(source_mask > 0.5)
+
+    if len(coords) == 0:
+        return None
+
+    return coords.mean(axis=0).astype(np.float32)
+
+
 def crop_to_mask_bbox(vol: np.ndarray, mask: np.ndarray) -> np.ndarray:
     coords = np.argwhere(mask > 0)
+
     if len(coords) == 0:
         return vol
+
     zmin, ymin, xmin = coords.min(axis=0)
     zmax, ymax, xmax = coords.max(axis=0)
+
     return vol[zmin:zmax + 1, ymin:ymax + 1, xmin:xmax + 1]
 
 
@@ -200,23 +238,191 @@ def compute_ssim_safe(a: np.ndarray, b: np.ndarray, data_range: float = 1.0) -> 
     if not HAS_SKIMAGE:
         return float("nan")
 
-    # Check if arrays have valid shape for SSIM
     if min(a.shape) < 7 or min(b.shape) < 7:
         return float("nan")
 
     try:
         return float(skimage_ssim(a, b, data_range=data_range))
     except Exception as e:
-        print(f"⚠️ SSIM computation failed: {e}")
+        print(f"� SSIM computation failed: {e}")
         return float("nan")
 
 
 def dice_score(mask_a: np.ndarray, mask_b: np.ndarray, eps: float = 1e-8) -> float:
     mask_a = mask_a.astype(bool)
     mask_b = mask_b.astype(bool)
+
     inter = np.logical_and(mask_a, mask_b).sum()
     denom = mask_a.sum() + mask_b.sum()
+
     return float((2.0 * inter) / (denom + eps))
+
+
+# =========================================================
+# PROFILE PEARSON HELPERS
+# =========================================================
+def sample_line_trilinear(vol: np.ndarray, p0, p1, n: int = 256) -> np.ndarray:
+    """
+    Muestrea una l�nea 3D con interpolaci�n trilineal.
+
+    vol: [Z, Y, X]
+    p0, p1: coordenadas flotantes [z, y, x]
+    """
+    vol = vol.astype(np.float32)
+    pts = np.linspace(p0, p1, n, dtype=np.float32)
+
+    Nz, Ny, Nx = vol.shape
+    out = np.zeros((n,), dtype=np.float32)
+
+    for i, (z, y, x) in enumerate(pts):
+        z0 = int(np.clip(np.floor(z), 0, Nz - 1))
+        y0 = int(np.clip(np.floor(y), 0, Ny - 1))
+        x0 = int(np.clip(np.floor(x), 0, Nx - 1))
+
+        z1 = min(z0 + 1, Nz - 1)
+        y1 = min(y0 + 1, Ny - 1)
+        x1 = min(x0 + 1, Nx - 1)
+
+        zd = z - z0
+        yd = y - y0
+        xd = x - x0
+
+        c000 = vol[z0, y0, x0]
+        c001 = vol[z0, y0, x1]
+        c010 = vol[z0, y1, x0]
+        c011 = vol[z0, y1, x1]
+        c100 = vol[z1, y0, x0]
+        c101 = vol[z1, y0, x1]
+        c110 = vol[z1, y1, x0]
+        c111 = vol[z1, y1, x1]
+
+        c00 = c000 * (1.0 - xd) + c001 * xd
+        c01 = c010 * (1.0 - xd) + c011 * xd
+        c10 = c100 * (1.0 - xd) + c101 * xd
+        c11 = c110 * (1.0 - xd) + c111 * xd
+
+        c0 = c00 * (1.0 - yd) + c01 * yd
+        c1 = c10 * (1.0 - yd) + c11 * yd
+
+        out[i] = c0 * (1.0 - zd) + c1 * zd
+
+    return out
+
+
+def extend_ray_to_volume_boundary(p0, p1, vol_shape):
+    """
+    Extiende el rayo desde p0 hacia p1 hasta el borde del volumen.
+
+    p0: source centroid [z, y, x]
+    p1: GT peak [z, y, x]
+    vol_shape: (Z, Y, X)
+    """
+    p0 = np.asarray(p0, dtype=np.float32)
+    p1 = np.asarray(p1, dtype=np.float32)
+
+    direction = p1 - p0
+    norm = np.linalg.norm(direction)
+
+    if norm < 1e-8:
+        return p1.astype(np.float32)
+
+    direction = direction / norm
+
+    bounds_min = np.array([0, 0, 0], dtype=np.float32)
+    bounds_max = np.array(
+        [vol_shape[0] - 1, vol_shape[1] - 1, vol_shape[2] - 1],
+        dtype=np.float32,
+    )
+
+    t_candidates = []
+
+    for i in range(3):
+        if direction[i] > 1e-8:
+            t = (bounds_max[i] - p0[i]) / direction[i]
+            t_candidates.append(t)
+        elif direction[i] < -1e-8:
+            t = (bounds_min[i] - p0[i]) / direction[i]
+            t_candidates.append(t)
+
+    t_candidates = [t for t in t_candidates if t > 0]
+
+    if len(t_candidates) == 0:
+        return p1.astype(np.float32)
+
+    t_exit = min(t_candidates)
+    p_end = p0 + t_exit * direction
+
+    return p_end.astype(np.float32)
+
+
+def pearson_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Pearson correlation entre dos curvas 1D.
+    """
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+
+    mask = np.isfinite(a) & np.isfinite(b)
+    a = a[mask]
+    b = b[mask]
+
+    if len(a) < 2:
+        return float("nan")
+
+    if np.std(a) < 1e-8 or np.std(b) < 1e-8:
+        return float("nan")
+
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def compute_profile_pearson_centroid_to_end(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    source_mask: np.ndarray,
+    brain_mask: np.ndarray,
+    n_samples: int = 256,
+) -> float:
+    """
+    Calcula Pearson entre las curvas GT y Pred a lo largo de:
+
+        source centroid -> GT brain peak -> volume boundary
+
+    Esta m�trica eval�a si la forma longitudinal aproximada del haz
+    es similar entre la simulaci�n k-Wave y la predicci�n del modelo.
+    """
+    brain_mask = brain_mask > 0.5
+
+    if brain_mask.sum() == 0:
+        return float("nan")
+
+    src_centroid = get_source_centroid(source_mask)
+
+    if src_centroid is None:
+        return float("nan")
+
+    gt_peak = np.array(get_peak_index_masked(gt, brain_mask), dtype=np.float32)
+
+    line_end = extend_ray_to_volume_boundary(
+        p0=src_centroid,
+        p1=gt_peak,
+        vol_shape=gt.shape,
+    )
+
+    prof_gt = sample_line_trilinear(
+        vol=gt,
+        p0=src_centroid,
+        p1=line_end,
+        n=n_samples,
+    )
+
+    prof_pred = sample_line_trilinear(
+        vol=pred,
+        p0=src_centroid,
+        p1=line_end,
+        n=n_samples,
+    )
+
+    return pearson_corr_1d(prof_gt, prof_pred)
 
 
 # =========================================================
@@ -226,13 +432,14 @@ def compute_metrics_one_sample(
     pred: np.ndarray,
     gt: np.ndarray,
     brain_mask: np.ndarray,
+    source_mask: np.ndarray,
     dx_mm: float,
     is_water_only: bool,
 ) -> Dict[str, float]:
 
     pred = np.clip(pred.astype(np.float32), 0.0, None)
     gt = gt.astype(np.float32)
-    brain_mask = (brain_mask > 0.5)
+    brain_mask_bool = brain_mask > 0.5
 
     # -----------------------------
     # Global metrics
@@ -241,17 +448,32 @@ def compute_metrics_one_sample(
     mae_global = float(np.mean(np.abs(pred - gt)))
     ssim_global = compute_ssim_safe(pred, gt, data_range=1.0)
 
+    # -----------------------------
+    # Approx. longitudinal profile Pearson
+    # -----------------------------
+    if is_water_only or brain_mask_bool.sum() == 0:
+        profile_pearson_centroid_to_end = float("nan")
+    else:
+        profile_pearson_centroid_to_end = compute_profile_pearson_centroid_to_end(
+            pred=pred,
+            gt=gt,
+            source_mask=source_mask,
+            brain_mask=brain_mask_bool,
+            n_samples=PROFILE_SAMPLES,
+        )
+
     out = {
         "mse_global": mse_global,
         "mae_global": mae_global,
         "ssim_global": ssim_global,
+        "profile_pearson_centroid_to_end": profile_pearson_centroid_to_end,
         "is_water_only": int(is_water_only),
     }
 
     # -----------------------------
     # Brain-only metrics
     # -----------------------------
-    if is_water_only or brain_mask.sum() == 0:
+    if is_water_only or brain_mask_bool.sum() == 0:
         out.update({
             "mse_brain": float("nan"),
             "mae_brain": float("nan"),
@@ -273,30 +495,32 @@ def compute_metrics_one_sample(
         })
         return out
 
-    pred_brain_vals = pred[brain_mask]
-    gt_brain_vals = gt[brain_mask]
+    pred_brain_vals = pred[brain_mask_bool]
+    gt_brain_vals = gt[brain_mask_bool]
 
     mse_brain = float(np.mean((pred_brain_vals - gt_brain_vals) ** 2))
     mae_brain = float(np.mean(np.abs(pred_brain_vals - gt_brain_vals)))
 
-    pred_brain_vol = pred * brain_mask.astype(np.float32)
-    gt_brain_vol = gt * brain_mask.astype(np.float32)
+    pred_brain_vol = pred * brain_mask_bool.astype(np.float32)
+    gt_brain_vol = gt * brain_mask_bool.astype(np.float32)
 
-    pred_brain_crop = crop_to_mask_bbox(pred_brain_vol, brain_mask)
-    gt_brain_crop = crop_to_mask_bbox(gt_brain_vol, brain_mask)
+    pred_brain_crop = crop_to_mask_bbox(pred_brain_vol, brain_mask_bool)
+    gt_brain_crop = crop_to_mask_bbox(gt_brain_vol, brain_mask_bool)
 
-    # Ensure crops have minimum size before SSIM
     if min(pred_brain_crop.shape) < 7 or min(gt_brain_crop.shape) < 7:
         ssim_brain = float("nan")
     else:
         ssim_brain = compute_ssim_safe(
-            pred_brain_crop, gt_brain_crop, data_range=1.0)
+            pred_brain_crop,
+            gt_brain_crop,
+            data_range=1.0,
+        )
 
     # -----------------------------
     # Peak in brain
     # -----------------------------
-    gt_peak_idx = get_peak_index_masked(gt, brain_mask)
-    pred_peak_idx = get_peak_index_masked(pred, brain_mask)
+    gt_peak_idx = get_peak_index_masked(gt, brain_mask_bool)
+    pred_peak_idx = get_peak_index_masked(pred, brain_mask_bool)
 
     gt_peak_val_brain = float(gt[gt_peak_idx])
     pred_peak_val_brain = float(pred[pred_peak_idx])
@@ -309,6 +533,7 @@ def compute_metrics_one_sample(
         (pred_peak_idx[1] - gt_peak_idx[1]) ** 2 +
         (pred_peak_idx[2] - gt_peak_idx[2]) ** 2
     )
+
     peak_loc_err_mm_brain = peak_loc_err_vox_brain * dx_mm
 
     # -----------------------------
@@ -320,11 +545,11 @@ def compute_metrics_one_sample(
     gt_thr70 = 0.70 * gt_peak_val_brain
     pr_thr70 = 0.70 * pred_peak_val_brain
 
-    gt_focus_thr50 = np.logical_and(gt >= gt_thr50, brain_mask)
-    pr_focus_thr50 = np.logical_and(pred >= pr_thr50, brain_mask)
+    gt_focus_thr50 = np.logical_and(gt >= gt_thr50, brain_mask_bool)
+    pr_focus_thr50 = np.logical_and(pred >= pr_thr50, brain_mask_bool)
 
-    gt_focus_thr70 = np.logical_and(gt >= gt_thr70, brain_mask)
-    pr_focus_thr70 = np.logical_and(pred >= pr_thr70, brain_mask)
+    gt_focus_thr70 = np.logical_and(gt >= gt_thr70, brain_mask_bool)
+    pr_focus_thr70 = np.logical_and(pred >= pr_thr70, brain_mask_bool)
 
     dice_focus_brain_thr50 = dice_score(gt_focus_thr50, pr_focus_thr50)
     dice_focus_brain_thr70 = dice_score(gt_focus_thr70, pr_focus_thr70)
@@ -357,6 +582,7 @@ def summarize_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
         "mse_global",
         "mae_global",
         "ssim_global",
+        "profile_pearson_centroid_to_end",
         "mse_brain",
         "mae_brain",
         "ssim_brain",
@@ -396,10 +622,15 @@ def summarize_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
     return out
 
 
+# =========================================================
+# CSV HELPERS
+# =========================================================
 def save_per_sample_csv(csv_path: str, rows: List[Dict[str, float]]):
     if len(rows) == 0:
         return
+
     fieldnames = list(rows[0].keys())
+
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -408,12 +639,16 @@ def save_per_sample_csv(csv_path: str, rows: List[Dict[str, float]]):
 
 def save_summary_csv(csv_path: str, summary: Dict[str, float]):
     fieldnames = list(summary.keys())
+
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerow(summary)
 
 
+# =========================================================
+# RANKING HELPERS
+# =========================================================
 def rankdata_desc(values: List[float]) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64)
     order = np.argsort(-arr)
@@ -430,6 +665,9 @@ def rankdata_asc(values: List[float]) -> np.ndarray:
     return ranks
 
 
+# =========================================================
+# EVALUATION
+# =========================================================
 @torch.no_grad()
 def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
     model, ckpt = load_model(ckpt_path, device)
@@ -439,6 +677,8 @@ def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
         X = batch["X"].to(device, non_blocking=True)
         y = batch["y"].to(device, non_blocking=True)
         brain = batch["brain_mask"].to(device, non_blocking=True)
+        src = batch["source_mask"].to(device, non_blocking=True)
+
         is_water_only = bool(batch["is_water_only"][0])
         file_name = batch["file_name"][0]
 
@@ -448,14 +688,17 @@ def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
         pred_np = pred[0, 0].detach().cpu().numpy()
         gt_np = y[0, 0].detach().cpu().numpy()
         brain_np = brain[0, 0].detach().cpu().numpy()
+        src_np = src[0, 0].detach().cpu().numpy()
 
         metrics = compute_metrics_one_sample(
             pred=pred_np,
             gt=gt_np,
             brain_mask=brain_np,
+            source_mask=src_np,
             dx_mm=DX_MM,
             is_water_only=is_water_only,
         )
+
         metrics["file"] = file_name
         all_rows.append(metrics)
 
@@ -499,15 +742,20 @@ def build_ranking(ranking_rows: List[Dict[str, float]]) -> List[Dict[str, float]
         row["composite_score"] = float(composite[i])
 
     ranking_rows = sorted(ranking_rows, key=lambda x: x["composite_score"])
+
     return ranking_rows
 
 
+# =========================================================
+# MAIN
+# =========================================================
 def main():
     print("Device:", DEVICE)
     print("TEST_DIR:", TEST_DIR)
     print("CKPT_DIR:", CKPT_DIR)
     print("OUT_DIR:", OUT_DIR)
     print("DX_MM:", DX_MM)
+    print("PROFILE_SAMPLES:", PROFILE_SAMPLES)
     print("Checkpoints found:", CKPT_NAMES)
 
     if len(CKPT_NAMES) == 0:
@@ -515,6 +763,7 @@ def main():
         return
 
     test_ds = TusTestDataset(TEST_DIR)
+
     test_loader = DataLoader(
         test_ds,
         batch_size=1,
@@ -533,10 +782,16 @@ def main():
             continue
 
         print(f"\nEvaluando {ckpt_name} ...")
-        rows, ckpt = evaluate_checkpoint(ckpt_path, test_loader, DEVICE)
+
+        rows, ckpt = evaluate_checkpoint(
+            ckpt_path=ckpt_path,
+            loader=test_loader,
+            device=DEVICE,
+        )
 
         per_sample_csv = os.path.join(
-            OUT_DIR, f"{os.path.splitext(ckpt_name)[0]}_per_sample.csv"
+            OUT_DIR,
+            f"{os.path.splitext(ckpt_name)[0]}_per_sample.csv",
         )
         save_per_sample_csv(per_sample_csv, rows)
 
@@ -545,7 +800,8 @@ def main():
         summary["epoch"] = int(ckpt.get("epoch", -1))
 
         summary_csv = os.path.join(
-            OUT_DIR, f"{os.path.splitext(ckpt_name)[0]}_summary.csv"
+            OUT_DIR,
+            f"{os.path.splitext(ckpt_name)[0]}_summary.csv",
         )
         save_summary_csv(summary_csv, summary)
 
@@ -555,9 +811,15 @@ def main():
             "n_samples": int(summary["n_samples"]),
             "n_water_only": int(summary["n_water_only"]),
             "n_non_water_only": int(summary["n_non_water_only"]),
+
             "mean_mse_global": summary["mean_mse_global"],
             "mean_mae_global": summary["mean_mae_global"],
             "mean_ssim_global": summary["mean_ssim_global"],
+
+            "mean_profile_pearson_centroid_to_end": summary[
+                "mean_profile_pearson_centroid_to_end"
+            ],
+
             "mean_mse_brain": summary["mean_mse_brain"],
             "mean_mae_brain": summary["mean_mae_brain"],
             "mean_ssim_brain": summary["mean_ssim_brain"],
@@ -574,6 +836,7 @@ def main():
             f"peak_rel_brain={summary['mean_peak_rel_err_brain']:.4f} | "
             f"mae_brain={summary['mean_mae_brain']:.4f} | "
             f"ssim_brain={summary['mean_ssim_brain']:.4f} | "
+            f"profile_r={summary['mean_profile_pearson_centroid_to_end']:.4f} | "
             f"dice50={summary['mean_dice_focus_brain_thr50']:.4f} | "
             f"dice70={summary['mean_dice_focus_brain_thr70']:.4f}"
         )
@@ -585,12 +848,14 @@ def main():
     ranking_rows = build_ranking(ranking_rows)
 
     ranking_csv = os.path.join(OUT_DIR, "checkpoint_ranking.csv")
+
     with open(ranking_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(ranking_rows[0].keys()))
         writer.writeheader()
         writer.writerows(ranking_rows)
 
     print(f"\nRanking guardado en: {ranking_csv}")
+
     print("\nTop checkpoints:")
     for row in ranking_rows[:5]:
         print(
@@ -598,7 +863,8 @@ def main():
             f"score={row['composite_score']:.3f} | "
             f"peak_loc_mm={row['mean_peak_loc_err_mm_brain']:.4f} | "
             f"peak_rel={row['mean_peak_rel_err_brain']:.4f} | "
-            f"mae_brain={row['mean_mae_brain']:.4f}"
+            f"mae_brain={row['mean_mae_brain']:.4f} | "
+            f"profile_r={row['mean_profile_pearson_centroid_to_end']:.4f}"
         )
 
 
