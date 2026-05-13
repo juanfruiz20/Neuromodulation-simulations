@@ -22,8 +22,8 @@ import os
 
 # 1. Define aquí manualmente la lista de tus archivos (rutas completas o relativas)
 mis_archivos = [
-    r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/test_metrics/epoch_030_summary.csv",
-    r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_base01_globalL1/test_metrics/best_summary.csv",
+    r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/test_metrics_brain/epoch_030_summary.csv",
+    r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_base01_globalL1/test_metrics_brain/best_summary.csv",
     r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp01_fromscratch_tb/test_metrics_brain/epoch_100_summary.csv",
     r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp04_300epoch/test_metrics_brain/epoch_290_summary.csv"
 ]
@@ -33,7 +33,7 @@ mis_archivos = [
 df_final = pd.concat([pd.read_csv(f) for f in mis_archivos], ignore_index=True)
 
 # 3. Guardar el resultado
-nombre_salida = 'master_results_manual.csv'
+nombre_salida = 'master_results_nuevo.csv'
 df_final.to_csv(nombre_salida, index=False)
 
 print(f"¡Listo! Se han unido {len(mis_archivos)} archivos en '{nombre_salida}'.")

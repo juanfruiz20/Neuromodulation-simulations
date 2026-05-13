@@ -31,20 +31,23 @@ except ImportError:
 # CONFIG
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
+
+# IMPORTANTE:
+# CKPT_DIR debe ser una carpeta, no un archivo .pth.
 CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp04_300epoch"
+
 OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Si el dataset se gener� con dx=1 mm, d�jalo en 1.0
 DX_MM = 1.0
 
-# N�mero de puntos para el perfil:
-# source centroid -> GT peak -> volume boundary
 PROFILE_SAMPLES = 256
 
+DICE_THRESHOLDS = [20, 30, 50, 70, 90]
+
 NUM_WORKERS = 0
-PIN_MEMORY = True
+PIN_MEMORY = True if DEVICE == "cuda" else False
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -65,6 +68,7 @@ def discover_checkpoints(ckpt_dir: str) -> List[str]:
 
     out = []
     seen = set()
+
     for n in names:
         if n not in seen:
             out.append(n)
@@ -73,7 +77,10 @@ def discover_checkpoints(ckpt_dir: str) -> List[str]:
     return out
 
 
-CKPT_NAMES = discover_checkpoints(CKPT_DIR)
+#CKPT_NAMES = discover_checkpoints(CKPT_DIR)
+
+# Si quieres evaluar solo un checkpoint espec�fico, usa esto:
+CKPT_NAMES = ["epoch_300.pth"]
 
 
 # =========================================================
@@ -97,7 +104,7 @@ def reconstruct_brain_mask(mask_skull: np.ndarray, is_water_only: bool) -> np.nd
 class TusTestDataset(Dataset):
     """
     Espera en cada .npz:
-      - is_water_only
+      - is_water_only o water_only
       - mask_skull
       - p_max_norm
       - source_mask
@@ -177,7 +184,6 @@ def load_model(ckpt_path: str, device: str):
         out_positive=True,
     ).to(device)
 
-    # Compatible con checkpoints antiguos de U-Net y nuevos de cGAN
     if isinstance(ckpt, dict) and "G" in ckpt:
         print("Cargando generador G desde checkpoint cGAN")
         model.load_state_dict(ckpt["G"], strict=True)
@@ -198,7 +204,7 @@ def load_model(ckpt_path: str, device: str):
 
 
 # =========================================================
-# HELPERS
+# GENERAL HELPERS
 # =========================================================
 def get_peak_index_masked(vol: np.ndarray, mask: np.ndarray) -> Tuple[int, int, int]:
     masked = np.where(mask > 0, vol, -np.inf)
@@ -207,16 +213,12 @@ def get_peak_index_masked(vol: np.ndarray, mask: np.ndarray) -> Tuple[int, int, 
 
 
 def get_source_centroid(source_mask: np.ndarray):
-    """
-    Calcula el centroide de la source_mask.
-    Devuelve coordenadas [z, y, x].
-    """
     coords = np.argwhere(source_mask > 0.5)
 
     if len(coords) == 0:
         return None
 
-    return coords.mean(axis=0).astype(np.float32)
+    return coords.mean(axis=0).astype(np.float32)  # z, y, x
 
 
 def crop_to_mask_bbox(vol: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -244,7 +246,7 @@ def compute_ssim_safe(a: np.ndarray, b: np.ndarray, data_range: float = 1.0) -> 
     try:
         return float(skimage_ssim(a, b, data_range=data_range))
     except Exception as e:
-        print(f"� SSIM computation failed: {e}")
+        print(f"� SSIM computation failed: {e}")
         return float("nan")
 
 
@@ -259,7 +261,7 @@ def dice_score(mask_a: np.ndarray, mask_b: np.ndarray, eps: float = 1e-8) -> flo
 
 
 # =========================================================
-# PROFILE PEARSON HELPERS
+# BEAM PROFILE HELPERS
 # =========================================================
 def sample_line_trilinear(vol: np.ndarray, p0, p1, n: int = 256) -> np.ndarray:
     """
@@ -375,30 +377,54 @@ def pearson_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def compute_profile_pearson_centroid_to_end(
+def mae_1d(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    MAE entre dos curvas 1D.
+    """
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+
+    mask = np.isfinite(a) & np.isfinite(b)
+    a = a[mask]
+    b = b[mask]
+
+    if len(a) == 0:
+        return float("nan")
+
+    return float(np.mean(np.abs(a - b)))
+
+
+def compute_profile_metrics_centroid_to_end(
     pred: np.ndarray,
     gt: np.ndarray,
     source_mask: np.ndarray,
     brain_mask: np.ndarray,
     n_samples: int = 256,
-) -> float:
+) -> Dict[str, float]:
     """
-    Calcula Pearson entre las curvas GT y Pred a lo largo de:
+    M�tricas entre las curvas GT y Pred a lo largo de:
 
         source centroid -> GT brain peak -> volume boundary
 
-    Esta m�trica eval�a si la forma longitudinal aproximada del haz
-    es similar entre la simulaci�n k-Wave y la predicci�n del modelo.
+    Calcula:
+      - profile_pearson_centroid_to_end
+      - profile_mae_centroid_to_end
     """
     brain_mask = brain_mask > 0.5
 
     if brain_mask.sum() == 0:
-        return float("nan")
+        return {
+            "profile_pearson_centroid_to_end": float("nan"),
+            "profile_mae_centroid_to_end": float("nan"),
+        }
 
     src_centroid = get_source_centroid(source_mask)
 
     if src_centroid is None:
-        return float("nan")
+        return {
+            "profile_pearson_centroid_to_end": float("nan"),
+            "profile_mae_centroid_to_end": float("nan"),
+        }
 
     gt_peak = np.array(get_peak_index_masked(gt, brain_mask), dtype=np.float32)
 
@@ -422,7 +448,13 @@ def compute_profile_pearson_centroid_to_end(
         n=n_samples,
     )
 
-    return pearson_corr_1d(prof_gt, prof_pred)
+    profile_pearson = pearson_corr_1d(prof_gt, prof_pred)
+    profile_mae = mae_1d(prof_gt, prof_pred)
+
+    return {
+        "profile_pearson_centroid_to_end": profile_pearson,
+        "profile_mae_centroid_to_end": profile_mae,
+    }
 
 
 # =========================================================
@@ -449,12 +481,15 @@ def compute_metrics_one_sample(
     ssim_global = compute_ssim_safe(pred, gt, data_range=1.0)
 
     # -----------------------------
-    # Approx. longitudinal profile Pearson
+    # Approx. beam profile metrics
     # -----------------------------
     if is_water_only or brain_mask_bool.sum() == 0:
-        profile_pearson_centroid_to_end = float("nan")
+        profile_metrics = {
+            "profile_pearson_centroid_to_end": float("nan"),
+            "profile_mae_centroid_to_end": float("nan"),
+        }
     else:
-        profile_pearson_centroid_to_end = compute_profile_pearson_centroid_to_end(
+        profile_metrics = compute_profile_metrics_centroid_to_end(
             pred=pred,
             gt=gt,
             source_mask=source_mask,
@@ -466,7 +501,7 @@ def compute_metrics_one_sample(
         "mse_global": mse_global,
         "mae_global": mae_global,
         "ssim_global": ssim_global,
-        "profile_pearson_centroid_to_end": profile_pearson_centroid_to_end,
+        **profile_metrics,
         "is_water_only": int(is_water_only),
     }
 
@@ -474,6 +509,11 @@ def compute_metrics_one_sample(
     # Brain-only metrics
     # -----------------------------
     if is_water_only or brain_mask_bool.sum() == 0:
+        dice_nan_metrics = {
+            f"dice_focus_brain_thr{thr}": float("nan")
+            for thr in DICE_THRESHOLDS
+        }
+
         out.update({
             "mse_brain": float("nan"),
             "mae_brain": float("nan"),
@@ -482,8 +522,7 @@ def compute_metrics_one_sample(
             "peak_rel_err_brain": float("nan"),
             "peak_loc_err_vox_brain": float("nan"),
             "peak_loc_err_mm_brain": float("nan"),
-            "dice_focus_brain_thr50": float("nan"),
-            "dice_focus_brain_thr70": float("nan"),
+            **dice_nan_metrics,
             "gt_peak_val_brain": float("nan"),
             "pred_peak_val_brain": float("nan"),
             "gt_peak_z": -1,
@@ -537,22 +576,23 @@ def compute_metrics_one_sample(
     peak_loc_err_mm_brain = peak_loc_err_vox_brain * dx_mm
 
     # -----------------------------
-    # Dice focus
+    # Dice focus at multiple thresholds
     # -----------------------------
-    gt_thr50 = 0.50 * gt_peak_val_brain
-    pr_thr50 = 0.50 * pred_peak_val_brain
+    dice_focus_metrics = {}
 
-    gt_thr70 = 0.70 * gt_peak_val_brain
-    pr_thr70 = 0.70 * pred_peak_val_brain
+    for thr in DICE_THRESHOLDS:
+        frac = thr / 100.0
 
-    gt_focus_thr50 = np.logical_and(gt >= gt_thr50, brain_mask_bool)
-    pr_focus_thr50 = np.logical_and(pred >= pr_thr50, brain_mask_bool)
+        gt_thr = frac * gt_peak_val_brain
+        pr_thr = frac * pred_peak_val_brain
 
-    gt_focus_thr70 = np.logical_and(gt >= gt_thr70, brain_mask_bool)
-    pr_focus_thr70 = np.logical_and(pred >= pr_thr70, brain_mask_bool)
+        gt_focus = np.logical_and(gt >= gt_thr, brain_mask_bool)
+        pr_focus = np.logical_and(pred >= pr_thr, brain_mask_bool)
 
-    dice_focus_brain_thr50 = dice_score(gt_focus_thr50, pr_focus_thr50)
-    dice_focus_brain_thr70 = dice_score(gt_focus_thr70, pr_focus_thr70)
+        dice_focus_metrics[f"dice_focus_brain_thr{thr}"] = dice_score(
+            gt_focus,
+            pr_focus,
+        )
 
     out.update({
         "mse_brain": mse_brain,
@@ -562,8 +602,7 @@ def compute_metrics_one_sample(
         "peak_rel_err_brain": peak_rel_err_brain,
         "peak_loc_err_vox_brain": float(peak_loc_err_vox_brain),
         "peak_loc_err_mm_brain": float(peak_loc_err_mm_brain),
-        "dice_focus_brain_thr50": dice_focus_brain_thr50,
-        "dice_focus_brain_thr70": dice_focus_brain_thr70,
+        **dice_focus_metrics,
         "gt_peak_val_brain": gt_peak_val_brain,
         "pred_peak_val_brain": pred_peak_val_brain,
         "gt_peak_z": int(gt_peak_idx[0]),
@@ -583,6 +622,7 @@ def summarize_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
         "mae_global",
         "ssim_global",
         "profile_pearson_centroid_to_end",
+        "profile_mae_centroid_to_end",
         "mse_brain",
         "mae_brain",
         "ssim_brain",
@@ -590,8 +630,7 @@ def summarize_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
         "peak_rel_err_brain",
         "peak_loc_err_vox_brain",
         "peak_loc_err_mm_brain",
-        "dice_focus_brain_thr50",
-        "dice_focus_brain_thr70",
+        *[f"dice_focus_brain_thr{thr}" for thr in DICE_THRESHOLDS],
     ]
 
     n_samples = len(rows)
@@ -706,6 +745,10 @@ def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
 
 
 def build_ranking(ranking_rows: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    """
+    Ranking original.
+    Se mantiene usando Dice 50 y Dice 70 para no cambiar el criterio hist�rico.
+    """
     if len(ranking_rows) == 0:
         return ranking_rows
 
@@ -756,6 +799,7 @@ def main():
     print("OUT_DIR:", OUT_DIR)
     print("DX_MM:", DX_MM)
     print("PROFILE_SAMPLES:", PROFILE_SAMPLES)
+    print("DICE_THRESHOLDS:", DICE_THRESHOLDS)
     print("Checkpoints found:", CKPT_NAMES)
 
     if len(CKPT_NAMES) == 0:
@@ -819,6 +863,9 @@ def main():
             "mean_profile_pearson_centroid_to_end": summary[
                 "mean_profile_pearson_centroid_to_end"
             ],
+            "mean_profile_mae_centroid_to_end": summary[
+                "mean_profile_mae_centroid_to_end"
+            ],
 
             "mean_mse_brain": summary["mean_mse_brain"],
             "mean_mae_brain": summary["mean_mae_brain"],
@@ -826,8 +873,13 @@ def main():
             "mean_peak_abs_err_brain": summary["mean_peak_abs_err_brain"],
             "mean_peak_rel_err_brain": summary["mean_peak_rel_err_brain"],
             "mean_peak_loc_err_mm_brain": summary["mean_peak_loc_err_mm_brain"],
-            "mean_dice_focus_brain_thr50": summary["mean_dice_focus_brain_thr50"],
-            "mean_dice_focus_brain_thr70": summary["mean_dice_focus_brain_thr70"],
+
+            **{
+                f"mean_dice_focus_brain_thr{thr}": summary[
+                    f"mean_dice_focus_brain_thr{thr}"
+                ]
+                for thr in DICE_THRESHOLDS
+            },
         })
 
         print(
@@ -837,8 +889,12 @@ def main():
             f"mae_brain={summary['mean_mae_brain']:.4f} | "
             f"ssim_brain={summary['mean_ssim_brain']:.4f} | "
             f"profile_r={summary['mean_profile_pearson_centroid_to_end']:.4f} | "
+            f"profile_mae={summary['mean_profile_mae_centroid_to_end']:.4f} | "
+            f"dice20={summary['mean_dice_focus_brain_thr20']:.4f} | "
+            f"dice30={summary['mean_dice_focus_brain_thr30']:.4f} | "
             f"dice50={summary['mean_dice_focus_brain_thr50']:.4f} | "
-            f"dice70={summary['mean_dice_focus_brain_thr70']:.4f}"
+            f"dice70={summary['mean_dice_focus_brain_thr70']:.4f} | "
+            f"dice90={summary['mean_dice_focus_brain_thr90']:.4f}"
         )
 
     if len(ranking_rows) == 0:
@@ -864,7 +920,13 @@ def main():
             f"peak_loc_mm={row['mean_peak_loc_err_mm_brain']:.4f} | "
             f"peak_rel={row['mean_peak_rel_err_brain']:.4f} | "
             f"mae_brain={row['mean_mae_brain']:.4f} | "
-            f"profile_r={row['mean_profile_pearson_centroid_to_end']:.4f}"
+            f"profile_r={row['mean_profile_pearson_centroid_to_end']:.4f} | "
+            f"profile_mae={row['mean_profile_mae_centroid_to_end']:.4f} | "
+            f"dice20={row['mean_dice_focus_brain_thr20']:.4f} | "
+            f"dice30={row['mean_dice_focus_brain_thr30']:.4f} | "
+            f"dice50={row['mean_dice_focus_brain_thr50']:.4f} | "
+            f"dice70={row['mean_dice_focus_brain_thr70']:.4f} | "
+            f"dice90={row['mean_dice_focus_brain_thr90']:.4f}"
         )
 
 
