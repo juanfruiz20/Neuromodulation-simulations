@@ -36,7 +36,7 @@ TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simula
 # CKPT_DIR debe ser una carpeta, no un archivo .pth.
 CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp04_300epoch"
 
-OUT_DIR = os.path.join(CKPT_DIR, "test_metrics_brain")
+OUT_DIR = os.path.join(CKPT_DIR, "test_metric_dice")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -80,7 +80,7 @@ def discover_checkpoints(ckpt_dir: str) -> List[str]:
 #CKPT_NAMES = discover_checkpoints(CKPT_DIR)
 
 # Si quieres evaluar solo un checkpoint espec�fico, usa esto:
-CKPT_NAMES = ["epoch_300.pth"]
+CKPT_NAMES = ["epoch_290.pth"]
 
 
 # =========================================================

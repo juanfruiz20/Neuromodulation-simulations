@@ -25,7 +25,7 @@ mis_archivos = [
     r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/test_metrics_brain/epoch_030_summary.csv",
     r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_base01_globalL1/test_metrics_brain/best_summary.csv",
     r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp01_fromscratch_tb/test_metrics_brain/epoch_100_summary.csv",
-    r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp04_300epoch/test_metrics_brain/epoch_290_summary.csv"
+    r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_exp04_300epoch/test_metric_dice/epoch_290_summary.csv"
 ]
 
 # 2. Leer y combinar directamente
