@@ -17,7 +17,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from src.dataloader import TusDataset
+from src.helpers.dataloader import TusDataset
 from src.modelos.ResUnet3D import ResUNet3D_HQ
 from src.modelos.Discriminator3D import PatchDiscriminator3D
 
