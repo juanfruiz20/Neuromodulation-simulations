@@ -77,10 +77,10 @@ def discover_checkpoints(ckpt_dir: str) -> List[str]:
     return out
 
 
-#CKPT_NAMES = discover_checkpoints(CKPT_DIR)
+CKPT_NAMES = discover_checkpoints(CKPT_DIR)
 
-# Si quieres evaluar solo un checkpoint espec�fico, usa esto:
-CKPT_NAMES = ["epoch_290.pth"]
+ #Si quieres evaluar solo un checkpoint espec�fico, usa esto:
+#·CKPT_NAMES = ["epoch_290.pth"]
 
 
 # =========================================================
