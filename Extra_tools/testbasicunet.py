@@ -6,10 +6,10 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from scipy.ndimage import binary_fill_holes
-
-from src.modelos.ResUnet3D import ResUNet3D_HQ
 
 
 # =========================================================
@@ -32,18 +32,15 @@ except ImportError:
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
 
-# IMPORTANTE:
-# CKPT_DIR debe ser una carpeta, no un archivo .pth.
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_TFG"
+# Carpeta donde guardaste la BasicUNet3D
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_basicresseunet3d_fulldata_100epochs/best.pth"
 
-OUT_DIR = os.path.join(CKPT_DIR, "test_metric_dice")
+OUT_DIR = os.path.join(CKPT_DIR, "test_metric_dice_basicunet")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 DX_MM = 1.0
-
 PROFILE_SAMPLES = 256
-
 DICE_THRESHOLDS = [20, 30, 50, 70, 90]
 
 NUM_WORKERS = 0
@@ -53,7 +50,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 
 # =========================================================
-# AUTO-DISCOVER DE CHECKPOINTS
+# AUTO-DISCOVER CHECKPOINTS
 # =========================================================
 def discover_checkpoints(ckpt_dir: str) -> List[str]:
     names = []
@@ -79,8 +76,110 @@ def discover_checkpoints(ckpt_dir: str) -> List[str]:
 
 CKPT_NAMES = discover_checkpoints(CKPT_DIR)
 
- #Si quieres evaluar solo un checkpoint espec�fico, usa esto:
-#·CKPT_NAMES = ["epoch_290.pth"]
+# Si quieres evaluar solo uno, descomenta:
+# CKPT_NAMES = ["epoch_050.pth"]
+# CKPT_NAMES = ["best.pth"]
+
+
+# =========================================================
+# BASIC 3D U-NET MODEL
+# =========================================================
+def make_group_norm(num_channels, preferred_groups=4):
+    groups = min(preferred_groups, num_channels)
+
+    while groups > 1 and (num_channels % groups != 0):
+        groups -= 1
+
+    return nn.GroupNorm(groups, num_channels)
+
+
+class ConvBlock3D(nn.Module):
+    """
+    Basic Conv3D block:
+    Conv3d -> GroupNorm -> ReLU -> Conv3d -> GroupNorm -> ReLU
+    """
+    def __init__(self, in_ch, out_ch, preferred_groups=4):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            make_group_norm(out_ch, preferred_groups),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            make_group_norm(out_ch, preferred_groups),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class BasicUNet3D(nn.Module):
+    """
+    Basic 3D U-Net baseline.
+
+    Input:
+      [B, 2, D, H, W] = source_mask + skull_mask
+
+    Output:
+      [B, 1, D, H, W] = predicted p_max_norm
+    """
+    def __init__(self, in_ch=2, out_ch=1, base=8, out_positive=True, norm_groups=4):
+        super().__init__()
+
+        self.out_positive = out_positive
+
+        # Encoder
+        self.enc1 = ConvBlock3D(in_ch, base, preferred_groups=norm_groups)
+        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)
+
+        self.enc2 = ConvBlock3D(base, base * 2, preferred_groups=norm_groups)
+        self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
+
+        self.enc3 = ConvBlock3D(base * 2, base * 4, preferred_groups=norm_groups)
+        self.pool3 = nn.MaxPool3d(kernel_size=2, stride=2)
+
+        # Bottleneck
+        self.bottleneck = ConvBlock3D(base * 4, base * 8, preferred_groups=norm_groups)
+
+        # Decoder
+        self.up3 = nn.ConvTranspose3d(base * 8, base * 4, kernel_size=2, stride=2)
+        self.dec3 = ConvBlock3D(base * 8, base * 4, preferred_groups=norm_groups)
+
+        self.up2 = nn.ConvTranspose3d(base * 4, base * 2, kernel_size=2, stride=2)
+        self.dec2 = ConvBlock3D(base * 4, base * 2, preferred_groups=norm_groups)
+
+        self.up1 = nn.ConvTranspose3d(base * 2, base, kernel_size=2, stride=2)
+        self.dec1 = ConvBlock3D(base * 2, base, preferred_groups=norm_groups)
+
+        self.out_conv = nn.Conv3d(base, out_ch, kernel_size=1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+
+        b = self.bottleneck(self.pool3(e3))
+
+        d3 = self.up3(b)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        out = self.out_conv(d1)
+
+        if self.out_positive:
+            out = F.softplus(out)
+
+        return out
 
 
 # =========================================================
@@ -111,7 +210,6 @@ class TusTestDataset(Dataset):
 
     Reconstruye brain_mask desde mask_skull.
     """
-
     def __init__(self, data_dir: str, expected_shape=(128, 128, 128)):
         super().__init__()
         self.data_dir = data_dir
@@ -175,31 +273,38 @@ class TusTestDataset(Dataset):
 def load_model(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    model = ResUNet3D_HQ(
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(f"Checkpoint inv�lido: {ckpt_path}")
+
+    cfg = ckpt.get("config", {})
+
+    base = int(cfg.get("base", 8))
+    norm_groups = int(cfg.get("norm_groups", 4))
+    out_positive = bool(cfg.get("out_positive", True))
+
+    print("Loading BasicUNet3D")
+    print(f"  checkpoint: {os.path.basename(ckpt_path)}")
+    print(f"  base={base}")
+    print(f"  norm_groups={norm_groups}")
+    print(f"  out_positive={out_positive}")
+
+    model = BasicUNet3D(
         in_ch=2,
         out_ch=1,
-        base=16,
-        norm_kind="group",
-        use_se=True,
-        out_positive=True,
+        base=base,
+        out_positive=out_positive,
+        norm_groups=norm_groups,
     ).to(device)
 
-    if isinstance(ckpt, dict) and "G" in ckpt:
-        print("Cargando generador G desde checkpoint cGAN")
-        model.load_state_dict(ckpt["G"], strict=True)
-
-    elif isinstance(ckpt, dict) and "model" in ckpt:
-        print("Cargando modelo desde checkpoint U-Net")
-        model.load_state_dict(ckpt["model"], strict=True)
-
-    else:
-        keys = list(ckpt.keys()) if isinstance(ckpt, dict) else type(ckpt)
+    if "model" not in ckpt:
         raise KeyError(
-            f"No se encontr� ni 'G' ni 'model' en el checkpoint: {ckpt_path}. "
-            f"Keys disponibles: {keys}"
+            f"No se encontr� la clave 'model' en el checkpoint: {ckpt_path}. "
+            f"Keys disponibles: {list(ckpt.keys())}"
         )
 
+    model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
+
     return model, ckpt
 
 
@@ -246,7 +351,7 @@ def compute_ssim_safe(a: np.ndarray, b: np.ndarray, data_range: float = 1.0) -> 
     try:
         return float(skimage_ssim(a, b, data_range=data_range))
     except Exception as e:
-        print(f"� SSIM computation failed: {e}")
+        print(f"SSIM computation failed: {e}")
         return float("nan")
 
 
@@ -358,9 +463,6 @@ def extend_ray_to_volume_boundary(p0, p1, vol_shape):
 
 
 def pearson_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Pearson correlation entre dos curvas 1D.
-    """
     a = np.asarray(a, dtype=np.float32)
     b = np.asarray(b, dtype=np.float32)
 
@@ -378,9 +480,6 @@ def pearson_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def mae_1d(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    MAE entre dos curvas 1D.
-    """
     a = np.asarray(a, dtype=np.float32)
     b = np.asarray(b, dtype=np.float32)
 
@@ -401,15 +500,7 @@ def compute_profile_metrics_centroid_to_end(
     brain_mask: np.ndarray,
     n_samples: int = 256,
 ) -> Dict[str, float]:
-    """
-    M�tricas entre las curvas GT y Pred a lo largo de:
 
-        source centroid -> GT brain peak -> volume boundary
-
-    Calcula:
-      - profile_pearson_centroid_to_end
-      - profile_mae_centroid_to_end
-    """
     brain_mask = brain_mask > 0.5
 
     if brain_mask.sum() == 0:
@@ -481,7 +572,7 @@ def compute_metrics_one_sample(
     ssim_global = compute_ssim_safe(pred, gt, data_range=1.0)
 
     # -----------------------------
-    # Approx. beam profile metrics
+    # Beam profile metrics
     # -----------------------------
     if is_water_only or brain_mask_bool.sum() == 0:
         profile_metrics = {
@@ -704,51 +795,7 @@ def rankdata_asc(values: List[float]) -> np.ndarray:
     return ranks
 
 
-# =========================================================
-# EVALUATION
-# =========================================================
-@torch.no_grad()
-def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
-    model, ckpt = load_model(ckpt_path, device)
-    all_rows = []
-
-    for batch in loader:
-        X = batch["X"].to(device, non_blocking=True)
-        y = batch["y"].to(device, non_blocking=True)
-        brain = batch["brain_mask"].to(device, non_blocking=True)
-        src = batch["source_mask"].to(device, non_blocking=True)
-
-        is_water_only = bool(batch["is_water_only"][0])
-        file_name = batch["file_name"][0]
-
-        pred = model(X)
-        pred = pred.clamp_min(0.0)
-
-        pred_np = pred[0, 0].detach().cpu().numpy()
-        gt_np = y[0, 0].detach().cpu().numpy()
-        brain_np = brain[0, 0].detach().cpu().numpy()
-        src_np = src[0, 0].detach().cpu().numpy()
-
-        metrics = compute_metrics_one_sample(
-            pred=pred_np,
-            gt=gt_np,
-            brain_mask=brain_np,
-            source_mask=src_np,
-            dx_mm=DX_MM,
-            is_water_only=is_water_only,
-        )
-
-        metrics["file"] = file_name
-        all_rows.append(metrics)
-
-    return all_rows, ckpt
-
-
 def build_ranking(ranking_rows: List[Dict[str, float]]) -> List[Dict[str, float]]:
-    """
-    Ranking original.
-    Se mantiene usando Dice 50 y Dice 70 para no cambiar el criterio hist�rico.
-    """
     if len(ranking_rows) == 0:
         return ranking_rows
 
@@ -787,6 +834,46 @@ def build_ranking(ranking_rows: List[Dict[str, float]]) -> List[Dict[str, float]
     ranking_rows = sorted(ranking_rows, key=lambda x: x["composite_score"])
 
     return ranking_rows
+
+
+# =========================================================
+# EVALUATION
+# =========================================================
+@torch.no_grad()
+def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
+    model, ckpt = load_model(ckpt_path, device)
+    all_rows = []
+
+    for batch in loader:
+        X = batch["X"].to(device, non_blocking=True)
+        y = batch["y"].to(device, non_blocking=True)
+        brain = batch["brain_mask"].to(device, non_blocking=True)
+        src = batch["source_mask"].to(device, non_blocking=True)
+
+        is_water_only = bool(batch["is_water_only"][0])
+        file_name = batch["file_name"][0]
+
+        pred = model(X)
+        pred = pred.clamp_min(0.0)
+
+        pred_np = pred[0, 0].detach().cpu().numpy()
+        gt_np = y[0, 0].detach().cpu().numpy()
+        brain_np = brain[0, 0].detach().cpu().numpy()
+        src_np = src[0, 0].detach().cpu().numpy()
+
+        metrics = compute_metrics_one_sample(
+            pred=pred_np,
+            gt=gt_np,
+            brain_mask=brain_np,
+            source_mask=src_np,
+            dx_mm=DX_MM,
+            is_water_only=is_water_only,
+        )
+
+        metrics["file"] = file_name
+        all_rows.append(metrics)
+
+    return all_rows, ckpt
 
 
 # =========================================================

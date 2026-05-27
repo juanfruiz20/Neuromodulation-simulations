@@ -41,9 +41,9 @@ def main():
     # =========================
     # CONFIG
     # =========================
-    SEED = 123
+    SEED = 120
 
-    SAVE_DIR = "checkpoints_cgan_exp04_300epoch"
+    SAVE_DIR = "checkpoints_cgan_TFG"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
