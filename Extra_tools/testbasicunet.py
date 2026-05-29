@@ -32,10 +32,11 @@ except ImportError:
 # =========================================================
 TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
 
-# Carpeta donde guardaste la BasicUNet3D
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_basicresseunet3d_fulldata_100epochs/best.pth"
+# IMPORTANTE:
+# CKPT_DIR debe ser una carpeta, no un archivo .pth.
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_resunet3d_hq_3L_l1_fulldata_100epochs"
 
-OUT_DIR = os.path.join(CKPT_DIR, "test_metric_dice_basicunet")
+OUT_DIR = os.path.join(CKPT_DIR, "test_metric_dice_resunet3d_hq_3L")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -79,107 +80,266 @@ CKPT_NAMES = discover_checkpoints(CKPT_DIR)
 # Si quieres evaluar solo uno, descomenta:
 # CKPT_NAMES = ["epoch_050.pth"]
 # CKPT_NAMES = ["best.pth"]
+# CKPT_NAMES = ["last.pth"]
 
 
 # =========================================================
-# BASIC 3D U-NET MODEL
+# REDUCED ResUNet3D_HQ: 3 LEVELS
 # =========================================================
-def make_group_norm(num_channels, preferred_groups=4):
-    groups = min(preferred_groups, num_channels)
+def norm3d(ch: int, kind: str = "group", groups: int = 8):
+    if kind == "instance":
+        return nn.InstanceNorm3d(ch, affine=True)
 
-    while groups > 1 and (num_channels % groups != 0):
-        groups -= 1
+    # Versi�n robusta: asegura que ch sea divisible por groups
+    g = min(groups, ch)
+    while g > 1 and ch % g != 0:
+        g -= 1
 
-    return nn.GroupNorm(groups, num_channels)
+    return nn.GroupNorm(num_groups=g, num_channels=ch)
 
 
-class ConvBlock3D(nn.Module):
-    """
-    Basic Conv3D block:
-    Conv3d -> GroupNorm -> ReLU -> Conv3d -> GroupNorm -> ReLU
-    """
-    def __init__(self, in_ch, out_ch, preferred_groups=4):
+class SEBlock3D(nn.Module):
+    def __init__(self, ch: int, reduction: int = 8):
         super().__init__()
 
-        self.block = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            make_group_norm(out_ch, preferred_groups),
-            nn.ReLU(inplace=True),
+        r = max(1, ch // reduction)
 
-            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            make_group_norm(out_ch, preferred_groups),
-            nn.ReLU(inplace=True),
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.fc1 = nn.Conv3d(ch, r, kernel_size=1)
+        self.fc2 = nn.Conv3d(r, ch, kernel_size=1)
+
+    def forward(self, x):
+        s = self.pool(x)
+        s = F.silu(self.fc1(s), inplace=True)
+        s = torch.sigmoid(self.fc2(s))
+
+        return x * s
+
+
+class ResBlock3D(nn.Module):
+    def __init__(self, in_ch, out_ch, norm_kind="group", use_se=True):
+        super().__init__()
+
+        self.conv1 = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.n1 = norm3d(out_ch, kind=norm_kind)
+
+        self.conv2 = nn.Conv3d(
+            out_ch,
+            out_ch,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.n2 = norm3d(out_ch, kind=norm_kind)
+
+        self.act = nn.SiLU(inplace=True)
+
+        self.skip = None
+        if in_ch != out_ch:
+            self.skip = nn.Conv3d(
+                in_ch,
+                out_ch,
+                kernel_size=1,
+                bias=False,
+            )
+
+        self.se = SEBlock3D(out_ch, reduction=8) if use_se else nn.Identity()
+
+    def forward(self, x):
+        identity = x if self.skip is None else self.skip(x)
+
+        x = self.act(self.n1(self.conv1(x)))
+        x = self.n2(self.conv2(x))
+        x = self.se(x)
+
+        x = self.act(x + identity)
+
+        return x
+
+
+class Down(nn.Module):
+    def __init__(self, in_ch, out_ch, norm_kind="group", use_se=True):
+        super().__init__()
+
+        self.down = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+
+        self.n = norm3d(out_ch, kind=norm_kind)
+        self.act = nn.SiLU(inplace=True)
+
+        self.block = ResBlock3D(
+            out_ch,
+            out_ch,
+            norm_kind=norm_kind,
+            use_se=use_se,
         )
 
     def forward(self, x):
-        return self.block(x)
+        x = self.act(self.n(self.down(x)))
+        x = self.block(x)
+
+        return x
 
 
-class BasicUNet3D(nn.Module):
+class UpConcat(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch, norm_kind="group", use_se=True):
+        super().__init__()
+
+        self.up = nn.Upsample(
+            scale_factor=2,
+            mode="trilinear",
+            align_corners=False,
+        )
+
+        self.conv_up = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=1,
+            bias=False,
+        )
+
+        self.block = ResBlock3D(
+            out_ch + skip_ch,
+            out_ch,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = self.conv_up(x)
+
+        if x.shape[-3:] != skip.shape[-3:]:
+            x = F.interpolate(
+                x,
+                size=skip.shape[-3:],
+                mode="trilinear",
+                align_corners=False,
+            )
+
+        x = torch.cat([skip, x], dim=1)
+        x = self.block(x)
+
+        return x
+
+
+class ResUNet3D_HQ_3L(nn.Module):
     """
-    Basic 3D U-Net baseline.
+    Reduced-depth ResUNet3D_HQ with 3 downsampling levels.
 
     Input:
-      [B, 2, D, H, W] = source_mask + skull_mask
+      [B, 2, 128, 128, 128]
 
     Output:
-      [B, 1, D, H, W] = predicted p_max_norm
+      [B, 1, 128, 128, 128]
     """
-    def __init__(self, in_ch=2, out_ch=1, base=8, out_positive=True, norm_groups=4):
+
+    def __init__(
+        self,
+        in_ch=2,
+        out_ch=1,
+        base=16,
+        norm_kind="group",
+        use_se=True,
+        out_positive=True,
+    ):
         super().__init__()
 
         self.out_positive = out_positive
+        self.out_act = nn.Softplus() if out_positive else nn.Identity()
 
         # Encoder
-        self.enc1 = ConvBlock3D(in_ch, base, preferred_groups=norm_groups)
-        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.stem = ResBlock3D(
+            in_ch,
+            base,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 128^3
 
-        self.enc2 = ConvBlock3D(base, base * 2, preferred_groups=norm_groups)
-        self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.d1 = Down(
+            base,
+            base * 2,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 64^3
 
-        self.enc3 = ConvBlock3D(base * 2, base * 4, preferred_groups=norm_groups)
-        self.pool3 = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.d2 = Down(
+            base * 2,
+            base * 4,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 32^3
+
+        self.d3 = Down(
+            base * 4,
+            base * 8,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 16^3
 
         # Bottleneck
-        self.bottleneck = ConvBlock3D(base * 4, base * 8, preferred_groups=norm_groups)
+        self.mid = ResBlock3D(
+            base * 8,
+            base * 16,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 16^3
 
         # Decoder
-        self.up3 = nn.ConvTranspose3d(base * 8, base * 4, kernel_size=2, stride=2)
-        self.dec3 = ConvBlock3D(base * 8, base * 4, preferred_groups=norm_groups)
+        self.u3 = UpConcat(
+            base * 16,
+            base * 4,
+            base * 4,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # -> 32^3
 
-        self.up2 = nn.ConvTranspose3d(base * 4, base * 2, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock3D(base * 4, base * 2, preferred_groups=norm_groups)
+        self.u2 = UpConcat(
+            base * 4,
+            base * 2,
+            base * 2,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # -> 64^3
 
-        self.up1 = nn.ConvTranspose3d(base * 2, base, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock3D(base * 2, base, preferred_groups=norm_groups)
+        self.u1 = UpConcat(
+            base * 2,
+            base,
+            base,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # -> 128^3
 
-        self.out_conv = nn.Conv3d(base, out_ch, kernel_size=1)
+        self.head = nn.Conv3d(base, out_ch, kernel_size=1)
 
     def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
+        s0 = self.stem(x)   # base, 128^3
+        s1 = self.d1(s0)    # 2b, 64^3
+        s2 = self.d2(s1)    # 4b, 32^3
+        s3 = self.d3(s2)    # 8b, 16^3
 
-        b = self.bottleneck(self.pool3(e3))
+        m = self.mid(s3)    # 16b, 16^3
 
-        d3 = self.up3(b)
-        d3 = torch.cat([d3, e3], dim=1)
-        d3 = self.dec3(d3)
+        x = self.u3(m, s2)  # 4b, 32^3
+        x = self.u2(x, s1)  # 2b, 64^3
+        x = self.u1(x, s0)  # b, 128^3
 
-        d2 = self.up2(d3)
-        d2 = torch.cat([d2, e2], dim=1)
-        d2 = self.dec2(d2)
+        x = self.head(x)
+        x = self.out_act(x)
 
-        d1 = self.up1(d2)
-        d1 = torch.cat([d1, e1], dim=1)
-        d1 = self.dec1(d1)
-
-        out = self.out_conv(d1)
-
-        if self.out_positive:
-            out = F.softplus(out)
-
-        return out
+        return x
 
 
 # =========================================================
@@ -210,8 +370,10 @@ class TusTestDataset(Dataset):
 
     Reconstruye brain_mask desde mask_skull.
     """
+
     def __init__(self, data_dir: str, expected_shape=(128, 128, 128)):
         super().__init__()
+
         self.data_dir = data_dir
         self.expected_shape = tuple(expected_shape)
         self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
@@ -276,31 +438,42 @@ def load_model(ckpt_path: str, device: str):
     if not isinstance(ckpt, dict):
         raise RuntimeError(f"Checkpoint inv�lido: {ckpt_path}")
 
-    cfg = ckpt.get("config", {})
-
-    base = int(cfg.get("base", 8))
-    norm_groups = int(cfg.get("norm_groups", 4))
-    out_positive = bool(cfg.get("out_positive", True))
-
-    print("Loading BasicUNet3D")
-    print(f"  checkpoint: {os.path.basename(ckpt_path)}")
-    print(f"  base={base}")
-    print(f"  norm_groups={norm_groups}")
-    print(f"  out_positive={out_positive}")
-
-    model = BasicUNet3D(
-        in_ch=2,
-        out_ch=1,
-        base=base,
-        out_positive=out_positive,
-        norm_groups=norm_groups,
-    ).to(device)
-
     if "model" not in ckpt:
         raise KeyError(
             f"No se encontr� la clave 'model' en el checkpoint: {ckpt_path}. "
             f"Keys disponibles: {list(ckpt.keys())}"
         )
+
+    cfg = ckpt.get("config", {})
+
+    model_type = cfg.get("model_type", "ResUNet3D_HQ_3L")
+    base = int(cfg.get("base", 16))
+    norm_kind = cfg.get("norm_kind", "group")
+    use_se = bool(cfg.get("use_se", True))
+    out_positive = bool(cfg.get("out_positive", True))
+
+    print("Loading model")
+    print(f"  checkpoint: {os.path.basename(ckpt_path)}")
+    print(f"  model_type={model_type}")
+    print(f"  base={base}")
+    print(f"  norm_kind={norm_kind}")
+    print(f"  use_se={use_se}")
+    print(f"  out_positive={out_positive}")
+
+    if model_type != "ResUNet3D_HQ_3L":
+        print(
+            f"[WARN] El checkpoint dice model_type={model_type}, "
+            "pero este script est� preparado para ResUNet3D_HQ_3L."
+        )
+
+    model = ResUNet3D_HQ_3L(
+        in_ch=2,
+        out_ch=1,
+        base=base,
+        norm_kind=norm_kind,
+        use_se=use_se,
+        out_positive=out_positive,
+    ).to(device)
 
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
@@ -784,6 +957,7 @@ def rankdata_desc(values: List[float]) -> np.ndarray:
     order = np.argsort(-arr)
     ranks = np.empty_like(order, dtype=np.float64)
     ranks[order] = np.arange(1, len(arr) + 1)
+
     return ranks
 
 
@@ -792,6 +966,7 @@ def rankdata_asc(values: List[float]) -> np.ndarray:
     order = np.argsort(arr)
     ranks = np.empty_like(order, dtype=np.float64)
     ranks[order] = np.arange(1, len(arr) + 1)
+
     return ranks
 
 
@@ -842,6 +1017,7 @@ def build_ranking(ranking_rows: List[Dict[str, float]]) -> List[Dict[str, float]
 @torch.no_grad()
 def evaluate_checkpoint(ckpt_path: str, loader: DataLoader, device: str):
     model, ckpt = load_model(ckpt_path, device)
+
     all_rows = []
 
     for batch in loader:

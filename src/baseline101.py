@@ -32,52 +32,44 @@ def seed_all(seed: int = 123):
 
 
 # =========================================================
-# BASIC RESIDUAL SE 3D U-NET
+# NORMALIZATION HELPER
 # =========================================================
-def make_group_norm(num_channels, preferred_groups=4):
-    """
-    Creates a valid GroupNorm layer.
-    GroupNorm is useful for 3D volumes with batch_size=1.
-    """
-    groups = min(preferred_groups, num_channels)
+def norm3d(ch: int, kind: str = "group", groups: int = 8):
+    if kind == "instance":
+        return nn.InstanceNorm3d(ch, affine=True)
 
-    while groups > 1 and (num_channels % groups != 0):
-        groups -= 1
-
-    return nn.GroupNorm(groups, num_channels)
+    return nn.GroupNorm(
+        num_groups=min(groups, ch),
+        num_channels=ch,
+    )
 
 
+# =========================================================
+# SQUEEZE-EXCITATION
+# =========================================================
 class SEBlock3D(nn.Module):
-    """
-    Simple Squeeze-and-Excitation block for 3D feature maps.
-    """
-    def __init__(self, channels, reduction=8):
+    def __init__(self, ch: int, reduction: int = 8):
         super().__init__()
 
-        hidden = max(channels // reduction, 1)
+        r = max(1, ch // reduction)
 
         self.pool = nn.AdaptiveAvgPool3d(1)
-
-        self.fc = nn.Sequential(
-            nn.Conv3d(channels, hidden, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(hidden, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
+        self.fc1 = nn.Conv3d(ch, r, kernel_size=1)
+        self.fc2 = nn.Conv3d(r, ch, kernel_size=1)
 
     def forward(self, x):
-        weights = self.pool(x)
-        weights = self.fc(weights)
-        return x * weights
+        s = self.pool(x)
+        s = F.silu(self.fc1(s), inplace=True)
+        s = torch.sigmoid(self.fc2(s))
+
+        return x * s
 
 
-class ResidualSEBlock3D(nn.Module):
-    """
-    Simple residual block with GroupNorm and optional SE.
-
-    Conv3D -> GroupNorm -> ReLU -> Conv3D -> GroupNorm -> SE -> skip -> ReLU
-    """
-    def __init__(self, in_ch, out_ch, norm_groups=4, use_se=True):
+# =========================================================
+# RESIDUAL BLOCK 3D
+# =========================================================
+class ResBlock3D(nn.Module):
+    def __init__(self, in_ch, out_ch, norm_kind="group", use_se=True):
         super().__init__()
 
         self.conv1 = nn.Conv3d(
@@ -87,7 +79,7 @@ class ResidualSEBlock3D(nn.Module):
             padding=1,
             bias=False,
         )
-        self.norm1 = make_group_norm(out_ch, norm_groups)
+        self.n1 = norm3d(out_ch, kind=norm_kind)
 
         self.conv2 = nn.Conv3d(
             out_ch,
@@ -96,8 +88,11 @@ class ResidualSEBlock3D(nn.Module):
             padding=1,
             bias=False,
         )
-        self.norm2 = make_group_norm(out_ch, norm_groups)
+        self.n2 = norm3d(out_ch, kind=norm_kind)
 
+        self.act = nn.SiLU(inplace=True)
+
+        self.skip = None
         if in_ch != out_ch:
             self.skip = nn.Conv3d(
                 in_ch,
@@ -105,175 +100,223 @@ class ResidualSEBlock3D(nn.Module):
                 kernel_size=1,
                 bias=False,
             )
-        else:
-            self.skip = nn.Identity()
 
         self.se = SEBlock3D(out_ch, reduction=8) if use_se else nn.Identity()
-        self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        identity = self.skip(x)
+        identity = x if self.skip is None else self.skip(x)
 
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.act(out)
+        x = self.act(self.n1(self.conv1(x)))
+        x = self.n2(self.conv2(x))
+        x = self.se(x)
 
-        out = self.conv2(out)
-        out = self.norm2(out)
+        x = self.act(x + identity)
 
-        out = self.se(out)
-
-        out = out + identity
-        out = self.act(out)
-
-        return out
+        return x
 
 
-class BasicResSEUNet3D(nn.Module):
+# =========================================================
+# DOWN / UP BLOCKS
+# =========================================================
+class Down(nn.Module):
+    def __init__(self, in_ch, out_ch, norm_kind="group", use_se=True):
+        super().__init__()
+
+        self.down = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+
+        self.n = norm3d(out_ch, kind=norm_kind)
+        self.act = nn.SiLU(inplace=True)
+
+        self.block = ResBlock3D(
+            out_ch,
+            out_ch,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )
+
+    def forward(self, x):
+        x = self.act(self.n(self.down(x)))
+        x = self.block(x)
+
+        return x
+
+
+class UpConcat(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch, norm_kind="group", use_se=True):
+        super().__init__()
+
+        self.up = nn.Upsample(
+            scale_factor=2,
+            mode="trilinear",
+            align_corners=False,
+        )
+
+        self.conv_up = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=1,
+            bias=False,
+        )
+
+        self.block = ResBlock3D(
+            out_ch + skip_ch,
+            out_ch,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = self.conv_up(x)
+
+        if x.shape[-3:] != skip.shape[-3:]:
+            x = F.interpolate(
+                x,
+                size=skip.shape[-3:],
+                mode="trilinear",
+                align_corners=False,
+            )
+
+        x = torch.cat([skip, x], dim=1)
+        x = self.block(x)
+
+        return x
+
+
+# =========================================================
+# REDUCED ResUNet3D_HQ: 3 LEVELS INSTEAD OF 4
+# =========================================================
+class ResUNet3D_HQ_3L(nn.Module):
     """
-    Intermediate baseline architecture.
+    Reduced-depth version of ResUNet3D_HQ.
 
-    This model is stronger than a plain BasicUNet3D because it keeps:
-    - residual blocks
+    Differences vs original ResUNet3D_HQ:
+    - Original: 4 downsampling levels, bottleneck at 8^3, max channels base*32.
+    - This version: 3 downsampling levels, bottleneck at 16^3, max channels base*16.
+
+    Keeps:
+    - ResBlock3D
     - SE blocks
-    - GroupNorm
-
-    But it is simpler than ResUNet3D_HQ because it uses:
-    - a reduced channel capacity
-    - a simple 3-level encoder-decoder
-    - simple residual-SE blocks
-    - no advanced HQ blocks
-    - no adversarial component
+    - GroupNorm / InstanceNorm option
+    - SiLU activation
+    - trilinear upsampling + 1x1 conv
+    - U-Net skip connections
+    - Softplus positive output
     """
 
     def __init__(
         self,
         in_ch=2,
         out_ch=1,
-        base=8,
-        norm_groups=4,
+        base=16,
+        norm_kind="group",
         use_se=True,
         out_positive=True,
-        out_activation="relu",
     ):
         super().__init__()
 
         self.out_positive = out_positive
-        self.out_activation = out_activation
+        self.out_act = nn.Softplus() if out_positive else nn.Identity()
 
+        # -------------------------
         # Encoder
-        self.enc1 = ResidualSEBlock3D(
-            in_ch=in_ch,
-            out_ch=base,
-            norm_groups=norm_groups,
+        # -------------------------
+        self.stem = ResBlock3D(
+            in_ch,
+            base,
+            norm_kind=norm_kind,
             use_se=use_se,
-        )
-        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)
+        )  # 128^3
 
-        self.enc2 = ResidualSEBlock3D(
-            in_ch=base,
-            out_ch=base * 2,
-            norm_groups=norm_groups,
+        self.d1 = Down(
+            base,
+            base * 2,
+            norm_kind=norm_kind,
             use_se=use_se,
-        )
-        self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
+        )  # 64^3
 
-        self.enc3 = ResidualSEBlock3D(
-            in_ch=base * 2,
-            out_ch=base * 4,
-            norm_groups=norm_groups,
-            use_se=use_se,
-        )
-        self.pool3 = nn.MaxPool3d(kernel_size=2, stride=2)
-
-        # Bottleneck
-        self.bottleneck = ResidualSEBlock3D(
-            in_ch=base * 4,
-            out_ch=base * 8,
-            norm_groups=norm_groups,
-            use_se=use_se,
-        )
-
-        # Decoder
-        self.up3 = nn.ConvTranspose3d(
-            base * 8,
+        self.d2 = Down(
+            base * 2,
             base * 4,
-            kernel_size=2,
-            stride=2,
-        )
-        self.dec3 = ResidualSEBlock3D(
-            in_ch=base * 8,
-            out_ch=base * 4,
-            norm_groups=norm_groups,
+            norm_kind=norm_kind,
             use_se=use_se,
-        )
+        )  # 32^3
 
-        self.up2 = nn.ConvTranspose3d(
+        self.d3 = Down(
+            base * 4,
+            base * 8,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 16^3
+
+        # -------------------------
+        # Bottleneck
+        # -------------------------
+        self.mid = ResBlock3D(
+            base * 8,
+            base * 16,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 16^3
+
+        # -------------------------
+        # Decoder
+        # -------------------------
+        self.u3 = UpConcat(
+            base * 16,
+            base * 4,
+            base * 4,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # -> 32^3
+
+        self.u2 = UpConcat(
             base * 4,
             base * 2,
-            kernel_size=2,
-            stride=2,
-        )
-        self.dec2 = ResidualSEBlock3D(
-            in_ch=base * 4,
-            out_ch=base * 2,
-            norm_groups=norm_groups,
+            base * 2,
+            norm_kind=norm_kind,
             use_se=use_se,
-        )
+        )  # -> 64^3
 
-        self.up1 = nn.ConvTranspose3d(
+        self.u1 = UpConcat(
             base * 2,
             base,
-            kernel_size=2,
-            stride=2,
-        )
-        self.dec1 = ResidualSEBlock3D(
-            in_ch=base * 2,
-            out_ch=base,
-            norm_groups=norm_groups,
+            base,
+            norm_kind=norm_kind,
             use_se=use_se,
-        )
+        )  # -> 128^3
 
-        self.out_conv = nn.Conv3d(base, out_ch, kernel_size=1)
-
-    def apply_output_activation(self, out):
-        if not self.out_positive:
-            return out
-
-        if self.out_activation == "relu":
-            return F.relu(out)
-
-        if self.out_activation == "softplus":
-            return F.softplus(out)
-
-        raise ValueError(f"Unknown out_activation: {self.out_activation}")
+        # -------------------------
+        # Head
+        # -------------------------
+        self.head = nn.Conv3d(base, out_ch, kernel_size=1)
 
     def forward(self, x):
         # Encoder
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
+        s0 = self.stem(x)   # base, 128^3
+        s1 = self.d1(s0)    # 2b, 64^3
+        s2 = self.d2(s1)    # 4b, 32^3
+        s3 = self.d3(s2)    # 8b, 16^3
 
         # Bottleneck
-        b = self.bottleneck(self.pool3(e3))
+        m = self.mid(s3)    # 16b, 16^3
 
         # Decoder
-        d3 = self.up3(b)
-        d3 = torch.cat([d3, e3], dim=1)
-        d3 = self.dec3(d3)
+        x = self.u3(m, s2)  # 4b, 32^3
+        x = self.u2(x, s1)  # 2b, 64^3
+        x = self.u1(x, s0)  # b, 128^3
 
-        d2 = self.up2(d3)
-        d2 = torch.cat([d2, e2], dim=1)
-        d2 = self.dec2(d2)
+        x = self.head(x)
+        x = self.out_act(x)
 
-        d1 = self.up1(d2)
-        d1 = torch.cat([d1, e1], dim=1)
-        d1 = self.dec1(d1)
-
-        out = self.out_conv(d1)
-        out = self.apply_output_activation(out)
-
-        return out
+        return x
 
 
 # =========================================================
@@ -501,7 +544,7 @@ def main():
     # =========================
     SEED = 123
 
-    SAVE_DIR = "checkpoints_basicresseunet3d_fulldata_100epochs"
+    SAVE_DIR = "checkpoints_resunet3d_hq_3L_l1_fulldata_100epochs"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     TRAIN_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/train"
@@ -517,12 +560,11 @@ def main():
     LR = 1e-4
     WEIGHT_DECAY = 1e-4
 
-    # Intermediate baseline architecture
-    BASE = 8
-    NORM_GROUPS = 4
+    # Reduced-depth ResUNet3D_HQ config
+    BASE = 16
+    NORM_KIND = "group"
     USE_SE = True
     OUT_POSITIVE = True
-    OUT_ACTIVATION = "relu"  # "relu" recommended to avoid positive background bias
 
     # Simple baseline loss
     LOSS_TYPE = "l1"
@@ -586,30 +628,28 @@ def main():
     # =========================
     # MODEL
     # =========================
-    model = BasicResSEUNet3D(
+    model = ResUNet3D_HQ_3L(
         in_ch=2,
         out_ch=1,
         base=BASE,
-        norm_groups=NORM_GROUPS,
+        norm_kind=NORM_KIND,
         use_se=USE_SE,
         out_positive=OUT_POSITIVE,
-        out_activation=OUT_ACTIVATION,
     ).to(device)
 
-    print("Training BasicResSEUNet3D intermediate baseline from scratch.")
+    print("Training reduced-depth ResUNet3D_HQ_3L baseline from scratch.")
     print("Configuration:")
-    print(f"  Model type: BasicResSEUNet3D")
+    print(f"  Model type: ResUNet3D_HQ_3L")
     print(f"  Train fraction: 1.0")
     print(f"  Epochs: {EPOCHS}")
     print(f"  Save epoch 50: {SAVE_EPOCH_50}")
     print(f"  Base channels: {BASE}")
-    print(f"  GroupNorm groups: {NORM_GROUPS}")
+    print(f"  Norm kind: {NORM_KIND}")
     print(f"  Use SE: {USE_SE}")
     print(f"  Out positive: {OUT_POSITIVE}")
-    print(f"  Out activation: {OUT_ACTIVATION}")
     print(f"  Loss: {LOSS_TYPE}")
-    print("No ResUNet3D_HQ, no adversarial loss.")
-    print("No focus-aware, peak-aware, gradient, or location losses.")
+    print("No adversarial loss.")
+    print("No focus-aware, peak-aware, gradient, location, or tube-aware losses.")
 
     # =========================
     # LOSS
@@ -651,17 +691,17 @@ def main():
     # SAVE CONFIG
     # =========================
     config = {
-        "experiment_name": "basicresseunet3d_fulldata_100epochs",
+        "experiment_name": "resunet3d_hq_3L_l1_fulldata_100epochs",
         "description": (
-            "Intermediate 3D U-Net baseline trained with the full training dataset "
-            "for 100 epochs. The model is a simplified encoder-decoder U-Net with "
-            "skip connections, residual blocks, squeeze-and-excitation modules, "
-            "GroupNorm, reduced channel capacity, and a positive output constraint. "
-            "It does not use ResUNet3D_HQ, adversarial loss, focus-aware loss, "
-            "peak-aware loss, gradient loss, location loss, peak-value loss, or "
-            "peak-ROI loss."
+            "Reduced-depth ResUNet3D_HQ baseline trained with the full training "
+            "dataset for 100 epochs using only a voxel-wise L1 reconstruction loss. "
+            "Compared with the full ResUNet3D_HQ, this model removes the deepest "
+            "encoder-decoder level, reducing the number of downsampling stages from "
+            "four to three while preserving residual blocks, SE blocks, GroupNorm, "
+            "SiLU activations, trilinear upsampling, U-Net skip connections and "
+            "Softplus positive output."
         ),
-        "model_type": "BasicResSEUNet3D",
+        "model_type": "ResUNet3D_HQ_3L",
         "seed": SEED,
         "save_dir": SAVE_DIR,
         "train_dir": TRAIN_DIR,
@@ -676,11 +716,9 @@ def main():
         "lr": LR,
         "weight_decay": WEIGHT_DECAY,
         "base": BASE,
-        "norm_kind": "group",
-        "norm_groups": NORM_GROUPS,
+        "norm_kind": NORM_KIND,
         "use_se": USE_SE,
         "out_positive": OUT_POSITIVE,
-        "out_activation": OUT_ACTIVATION,
         "loss_type": LOSS_TYPE,
         "optimizer": "AdamW",
         "scheduler": {

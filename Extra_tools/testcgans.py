@@ -34,7 +34,7 @@ TEST_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simula
 
 # IMPORTANTE:
 # CKPT_DIR debe ser una carpeta, no un archivo .pth.
-CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_TFG"
+CKPT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_resunet3d_hq_3L_l1_fulldata_100epochs"
 
 OUT_DIR = os.path.join(CKPT_DIR, "test_metric_dice")
 

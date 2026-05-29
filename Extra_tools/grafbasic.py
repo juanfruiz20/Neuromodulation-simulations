@@ -14,8 +14,8 @@ from scipy.ndimage import (
 )
 
 import torch
-
-from src.modelos.ResUnet3D import ResUNet3D_HQ
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 # =========================================================
@@ -23,9 +23,9 @@ from src.modelos.ResUnet3D import ResUNet3D_HQ
 # =========================================================
 DATA_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
 
-CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_resunet3d_hq_3L_l1_fulldata_100epochs/best.pth"
+CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_resunet3d_hq_3L_l1_fulldata_100epochs/epoch_050.pth"
 
-OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/tablas/GT_vs_PRED_examples"
+OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/tablas/GT_vs_PRED_examples_3L_hor"
 
 EXPECTED_SHAPE = (128, 128, 128)
 
@@ -35,11 +35,11 @@ N_CASES = 2
 
 # Si quieres forzar casos concretos, pon aqu� los nombres exactos.
 # Si queda vac�o, selecciona 2 casos no-water diversos autom�ticamente.
-FORCE_FILES = set()
-FORCE_FILES = {
-    "sample_0023.npz",
-     "sample_0327.npz",
-}
+FORCE_FILES = [
+    "sample_0981.npz",
+    "sample_0327.npz",
+]
+# FORCE_FILES = []
 
 PLANES = ["sagittal", "coronal", "axial"]
 
@@ -47,19 +47,9 @@ CMAP_ANATOMY = "gray"
 CMAP_INTENSITY = "jet"
 
 DPI = 320
-SAVE_NAME = "gt_vs_prediction_2_cases_3_planes.png"
+SAVE_NAME = "gt_vs_prediction_2_cases_3_planes_resunet3d_hq_3L.png"
 
 SHOW_PEAK_MARKER = False
-
-# =========================================================
-# Model config
-# Ajusta estos par�metros si tu ResUNet3D_HQ se inicializa diferente.
-# =========================================================
-MODEL_KWARGS = dict(
-    in_ch=2,
-    out_ch=1,
-    out_positive=True,
-)
 
 # =========================================================
 # Transducer contour visualization
@@ -79,6 +69,264 @@ TRANSDUCER_VIS_MODE = "full_projection"
 DIVERSE_SELECTION_SEED_INDEX = 11
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+
+# =========================================================
+# REDUCED ResUNet3D_HQ: 3 LEVELS
+# =========================================================
+def norm3d(ch: int, kind: str = "group", groups: int = 8):
+    if kind == "instance":
+        return nn.InstanceNorm3d(ch, affine=True)
+
+    g = min(groups, ch)
+    while g > 1 and ch % g != 0:
+        g -= 1
+
+    return nn.GroupNorm(num_groups=g, num_channels=ch)
+
+
+class SEBlock3D(nn.Module):
+    def __init__(self, ch: int, reduction: int = 8):
+        super().__init__()
+
+        r = max(1, ch // reduction)
+
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.fc1 = nn.Conv3d(ch, r, kernel_size=1)
+        self.fc2 = nn.Conv3d(r, ch, kernel_size=1)
+
+    def forward(self, x):
+        s = self.pool(x)
+        s = F.silu(self.fc1(s), inplace=True)
+        s = torch.sigmoid(self.fc2(s))
+
+        return x * s
+
+
+class ResBlock3D(nn.Module):
+    def __init__(self, in_ch, out_ch, norm_kind="group", use_se=True):
+        super().__init__()
+
+        self.conv1 = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.n1 = norm3d(out_ch, kind=norm_kind)
+
+        self.conv2 = nn.Conv3d(
+            out_ch,
+            out_ch,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.n2 = norm3d(out_ch, kind=norm_kind)
+
+        self.act = nn.SiLU(inplace=True)
+
+        self.skip = None
+        if in_ch != out_ch:
+            self.skip = nn.Conv3d(
+                in_ch,
+                out_ch,
+                kernel_size=1,
+                bias=False,
+            )
+
+        self.se = SEBlock3D(out_ch, reduction=8) if use_se else nn.Identity()
+
+    def forward(self, x):
+        identity = x if self.skip is None else self.skip(x)
+
+        x = self.act(self.n1(self.conv1(x)))
+        x = self.n2(self.conv2(x))
+        x = self.se(x)
+
+        x = self.act(x + identity)
+
+        return x
+
+
+class Down(nn.Module):
+    def __init__(self, in_ch, out_ch, norm_kind="group", use_se=True):
+        super().__init__()
+
+        self.down = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+
+        self.n = norm3d(out_ch, kind=norm_kind)
+        self.act = nn.SiLU(inplace=True)
+
+        self.block = ResBlock3D(
+            out_ch,
+            out_ch,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )
+
+    def forward(self, x):
+        x = self.act(self.n(self.down(x)))
+        x = self.block(x)
+
+        return x
+
+
+class UpConcat(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch, norm_kind="group", use_se=True):
+        super().__init__()
+
+        self.up = nn.Upsample(
+            scale_factor=2,
+            mode="trilinear",
+            align_corners=False,
+        )
+
+        self.conv_up = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=1,
+            bias=False,
+        )
+
+        self.block = ResBlock3D(
+            out_ch + skip_ch,
+            out_ch,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = self.conv_up(x)
+
+        if x.shape[-3:] != skip.shape[-3:]:
+            x = F.interpolate(
+                x,
+                size=skip.shape[-3:],
+                mode="trilinear",
+                align_corners=False,
+            )
+
+        x = torch.cat([skip, x], dim=1)
+        x = self.block(x)
+
+        return x
+
+
+class ResUNet3D_HQ_3L(nn.Module):
+    """
+    Reduced-depth ResUNet3D_HQ with 3 downsampling levels.
+
+    Input:
+      [B, 2, 128, 128, 128]
+
+    Output:
+      [B, 1, 128, 128, 128]
+    """
+
+    def __init__(
+        self,
+        in_ch=2,
+        out_ch=1,
+        base=16,
+        norm_kind="group",
+        use_se=True,
+        out_positive=True,
+    ):
+        super().__init__()
+
+        self.out_positive = out_positive
+        self.out_act = nn.Softplus() if out_positive else nn.Identity()
+
+        # Encoder
+        self.stem = ResBlock3D(
+            in_ch,
+            base,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 128^3
+
+        self.d1 = Down(
+            base,
+            base * 2,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 64^3
+
+        self.d2 = Down(
+            base * 2,
+            base * 4,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 32^3
+
+        self.d3 = Down(
+            base * 4,
+            base * 8,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 16^3
+
+        # Bottleneck
+        self.mid = ResBlock3D(
+            base * 8,
+            base * 16,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # 16^3
+
+        # Decoder
+        self.u3 = UpConcat(
+            base * 16,
+            base * 4,
+            base * 4,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # -> 32^3
+
+        self.u2 = UpConcat(
+            base * 4,
+            base * 2,
+            base * 2,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # -> 64^3
+
+        self.u1 = UpConcat(
+            base * 2,
+            base,
+            base,
+            norm_kind=norm_kind,
+            use_se=use_se,
+        )  # -> 128^3
+
+        self.head = nn.Conv3d(base, out_ch, kernel_size=1)
+
+    def forward(self, x):
+        s0 = self.stem(x)   # base, 128^3
+        s1 = self.d1(s0)    # 2b, 64^3
+        s2 = self.d2(s1)    # 4b, 32^3
+        s3 = self.d3(s2)    # 8b, 16^3
+
+        m = self.mid(s3)    # 16b, 16^3
+
+        x = self.u3(m, s2)  # 4b, 32^3
+        x = self.u2(x, s1)  # 2b, 64^3
+        x = self.u1(x, s0)  # b, 128^3
+
+        x = self.head(x)
+        x = self.out_act(x)
+
+        return x
 
 
 # =========================================================
@@ -310,23 +558,23 @@ def strip_prefix_if_present(state_dict, prefixes):
 
 def extract_generator_state_dict(ckpt):
     """
-    Intenta extraer el state_dict del generador desde distintos formatos
-    comunes de checkpoints.
+    Extrae el state_dict desde distintos formatos de checkpoint.
+    Para esta U-Net reducida normalmente ser� ckpt["model"].
     """
     if not isinstance(ckpt, dict):
         return ckpt
 
     possible_keys = [
+        "model",
+        "model_state_dict",
+        "state_dict",
         "generator_state_dict",
         "gen_state_dict",
         "G_state_dict",
         "netG_state_dict",
-        "model_state_dict",
-        "state_dict",
         "generator",
         "gen",
         "G",
-        "model",
     ]
 
     for key in possible_keys:
@@ -335,27 +583,57 @@ def extract_generator_state_dict(ckpt):
 
     # Si parece que el checkpoint ya es directamente un state_dict
     if all(isinstance(k, str) for k in ckpt.keys()):
-        tensor_like = [
-            torch.is_tensor(v) for v in ckpt.values()
-        ]
+        tensor_like = [torch.is_tensor(v) for v in ckpt.values()]
         if len(tensor_like) > 0 and any(tensor_like):
             return ckpt
 
     raise RuntimeError(
-        "No se pudo encontrar el state_dict del generador dentro del checkpoint."
+        "No se pudo encontrar el state_dict del modelo dentro del checkpoint."
     )
 
 
 def load_generator_model(ckpt_path: str, device: str):
     print("\n======================================")
-    print("Loading model")
+    print("Loading ResUNet3D_HQ_3L model")
     print("======================================")
     print("CKPT_PATH:", ckpt_path)
     print("DEVICE:", device)
 
-    model = ResUNet3D_HQ(**MODEL_KWARGS).to(device)
-
     ckpt = torch.load(ckpt_path, map_location=device)
+
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(f"Checkpoint inv�lido: {ckpt_path}")
+
+    cfg = ckpt.get("config", {})
+
+    model_type = cfg.get("model_type", "ResUNet3D_HQ_3L")
+    base = int(cfg.get("base", 16))
+    norm_kind = cfg.get("norm_kind", "group")
+    use_se = bool(cfg.get("use_se", True))
+    out_positive = bool(cfg.get("out_positive", True))
+
+    print("Checkpoint config:")
+    print(f"  model_type={model_type}")
+    print(f"  base={base}")
+    print(f"  norm_kind={norm_kind}")
+    print(f"  use_se={use_se}")
+    print(f"  out_positive={out_positive}")
+
+    if model_type != "ResUNet3D_HQ_3L":
+        print(
+            f"[WARN] El checkpoint dice model_type={model_type}, "
+            "pero este script est� preparado para ResUNet3D_HQ_3L."
+        )
+
+    model = ResUNet3D_HQ_3L(
+        in_ch=2,
+        out_ch=1,
+        base=base,
+        norm_kind=norm_kind,
+        use_se=use_se,
+        out_positive=out_positive,
+    ).to(device)
+
     state_dict = extract_generator_state_dict(ckpt)
 
     state_dict = strip_prefix_if_present(
@@ -376,10 +654,17 @@ def load_generator_model(ckpt_path: str, device: str):
     print(f"[INFO] Unexpected keys: {len(unexpected)}")
 
     if len(missing) > 0:
-        print("[WARN] First missing keys:", missing[:5])
+        print("[WARN] First missing keys:", missing[:10])
 
     if len(unexpected) > 0:
-        print("[WARN] First unexpected keys:", unexpected[:5])
+        print("[WARN] First unexpected keys:", unexpected[:10])
+
+    if len(missing) > 0 or len(unexpected) > 0:
+        print(
+            "[WARN] El modelo carg� con strict=False. "
+            "Si hay muchas missing/unexpected keys, revisa que el checkpoint "
+            "corresponda exactamente a ResUNet3D_HQ_3L."
+        )
 
     model.eval()
     return model
@@ -539,24 +824,37 @@ def plot_gt_vs_prediction(cases, save_path):
     n_cases = len(cases)
     n_planes = len(PLANES)
 
-    # 3 filas por caso:
-    # Geometry + Ground truth + Prediction
-    n_rows = n_cases * 3
-    n_cols = n_planes
+    # Figura más alta y menos ancha para que las imágenes cuadradas llenen el espacio
+    fig = plt.figure(figsize=(9.2, 5.25))
 
-    fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(9.2, 13.6),
+    # Grid externo: un bloque por caso
+    outer = fig.add_gridspec(
+        nrows=1,
+        ncols=n_cases,
+        left=0.043,
+        right=0.997,
+        bottom=0.055,
+        top=0.855,
+        wspace=0.018,   # espacio entre Case 1 y Case 2
     )
 
-    if n_rows == 1:
-        axes = np.expand_dims(axes, axis=0)
+    all_axes = []
 
-    if n_cols == 1:
-        axes = np.expand_dims(axes, axis=1)
+    row_geom = 0
+    row_gt = 1
+    row_pred = 2
 
     for case_idx, case in enumerate(cases):
+        # Grid interno: 3 filas x 3 planos por cada caso
+        inner = outer[case_idx].subgridspec(
+            nrows=3,
+            ncols=n_planes,
+            wspace=0.002,   # MUY pegado horizontalmente dentro del caso
+            hspace=0.002,   # MUY pegado verticalmente
+        )
+
+        case_axes = np.empty((3, n_planes), dtype=object)
+
         gt = case["gt"]
         pred = case["pred"]
         src = case["source_mask"]
@@ -564,21 +862,11 @@ def plot_gt_vs_prediction(cases, save_path):
         anatomy = case["anatomy"]
         brain = case["brain_mask"]
 
-        # GT and Prediction are shown on the same GT-peak slices.
         z_peak, y_peak, x_peak = get_peak_index(gt, brain)
-
-        # Geometry row is centered on the skull.
         z_skull, y_skull, x_skull = get_skull_center(skull)
 
-        row_geom = case_idx * 3
-        row_gt = case_idx * 3 + 1
-        row_pred = case_idx * 3 + 2
-
-        # Same scale for GT and prediction within each case.
-        # This makes the comparison visually fair.
         case_vmin = 0.0
         case_vmax = float(max(gt.max(), pred.max()))
-
         if case_vmax <= 0:
             case_vmax = 1.0
 
@@ -587,14 +875,18 @@ def plot_gt_vs_prediction(cases, save_path):
             dilation_iters=TRANSDUCER_DILATION_ITERS,
         )
 
-        for col, plane in enumerate(PLANES):
-            ax_geom = axes[row_geom, col]
-            ax_gt = axes[row_gt, col]
-            ax_pred = axes[row_pred, col]
+        for plane_idx, plane in enumerate(PLANES):
+            ax_geom = fig.add_subplot(inner[row_geom, plane_idx])
+            ax_gt = fig.add_subplot(inner[row_gt, plane_idx])
+            ax_pred = fig.add_subplot(inner[row_pred, plane_idx])
 
-            # -------------------------------------------------
+            case_axes[row_geom, plane_idx] = ax_geom
+            case_axes[row_gt, plane_idx] = ax_gt
+            case_axes[row_pred, plane_idx] = ax_pred
+
+            # =================================================
             # GEOMETRY
-            # -------------------------------------------------
+            # =================================================
             anatomy_slice = extract_plane(
                 anatomy,
                 z_skull,
@@ -602,7 +894,6 @@ def plot_gt_vs_prediction(cases, save_path):
                 x_skull,
                 plane,
             )
-
             anatomy_slice = normalize_for_display(anatomy_slice)
 
             ax_geom.imshow(
@@ -625,9 +916,9 @@ def plot_gt_vs_prediction(cases, save_path):
 
             draw_transducer_contour(ax_geom, src_vis_slice)
 
-            # -------------------------------------------------
+            # =================================================
             # GROUND TRUTH
-            # -------------------------------------------------
+            # =================================================
             gt_slice = extract_plane(
                 gt,
                 z_peak,
@@ -645,9 +936,9 @@ def plot_gt_vs_prediction(cases, save_path):
                 interpolation="nearest",
             )
 
-            # -------------------------------------------------
+            # =================================================
             # PREDICTION
-            # -------------------------------------------------
+            # =================================================
             pred_slice = extract_plane(
                 pred,
                 z_peak,
@@ -673,109 +964,102 @@ def plot_gt_vs_prediction(cases, save_path):
                         py,
                         marker="+",
                         color="white",
-                        markersize=8,
-                        markeredgewidth=1.3,
+                        markersize=5,
+                        markeredgewidth=0.9,
                     )
 
-            if case_idx == 0:
-                ax_geom.set_title(
-                    plane_titles[plane],
-                    fontsize=15,
-                    fontweight="semibold",
-                    pad=3,
-                )
+            # Títulos de plano pequeños y pegados
+            ax_geom.set_title(
+                plane_titles[plane],
+                fontsize=8.1,
+                fontweight="semibold",
+                pad=1.0,
+            )
 
             for ax in [ax_geom, ax_gt, ax_pred]:
                 ax.set_xticks([])
                 ax.set_yticks([])
+                ax.set_aspect("equal", adjustable="box")
 
                 for spine in ax.spines.values():
                     spine.set_color("white")
-                    spine.set_linewidth(0.7)
+                    spine.set_linewidth(0.35)
 
-    # Compact layout
-    plt.subplots_adjust(
-        left=0.125,
-        right=0.998,
-        top=0.974,
-        bottom=0.022,
-        wspace=0.008,
-        hspace=0.008,
-    )
+        all_axes.append(case_axes)
 
-    # =========================================================
-    # LEFT LABELS
-    # =========================================================
     fig.canvas.draw()
 
-    for case_idx in range(n_cases):
-        row_geom = case_idx * 3
-        row_gt = case_idx * 3 + 1
-        row_pred = case_idx * 3 + 2
+    # =====================================================
+    # LABELS DE FILA A LA IZQUIERDA, MÁS PEGADOS
+    # =====================================================
+    first_case_axes = all_axes[0]
 
-        pos_geom = axes[row_geom, 0].get_position()
-        pos_gt = axes[row_gt, 0].get_position()
-        pos_pred = axes[row_pred, 0].get_position()
+    row_labels = {
+        row_geom: "Geometry",
+        row_gt: "Ground truth",
+        row_pred: "Prediction",
+    }
 
-        # Center of the full case block
-        y_case = 0.5 * (pos_geom.y1 + pos_pred.y0)
-
-        y_geometry = 0.5 * (pos_geom.y0 + pos_geom.y1)
-        y_gt = 0.5 * (pos_gt.y0 + pos_gt.y1)
-        y_pred = 0.5 * (pos_pred.y0 + pos_pred.y1)
-
-        x_case = pos_geom.x0 - 0.044
-        x_label = pos_geom.x0 - 0.020
+    for row_idx, label in row_labels.items():
+        pos = first_case_axes[row_idx, 0].get_position()
+        y_center = 0.5 * (pos.y0 + pos.y1)
 
         fig.text(
-            x_case,
-            y_case,
-            f"Case {case_idx + 1}",
+            pos.x0 - 0.008,
+            y_center,
+            label,
             rotation=90,
             va="center",
             ha="center",
-            fontsize=9.8,
+            fontsize=7.5,
             fontweight="semibold",
         )
 
-        fig.text(
-            x_label,
-            y_geometry,
-            "Geometry",
-            rotation=90,
-            va="center",
-            ha="center",
-            fontsize=8.6,
-            fontweight="normal",
-        )
+    # =====================================================
+    # CASE LABELS ARRIBA, SIN SUPERPONERSE
+    # =====================================================
+    for case_idx in range(n_cases):
+        case_axes = all_axes[case_idx]
+
+        pos_left = case_axes[0, 0].get_position()
+        pos_right = case_axes[0, n_planes - 1].get_position()
+
+        x_center = 0.5 * (pos_left.x0 + pos_right.x1)
+        y_top = pos_left.y1 + 0.060
 
         fig.text(
-            x_label,
-            y_gt,
-            "Ground truth",
-            rotation=90,
+            x_center,
+            y_top,
+            f"Case {case_idx + 1}",
             va="center",
             ha="center",
-            fontsize=8.6,
-            fontweight="normal",
+            fontsize=9.3,
+            fontweight="bold",
         )
 
-        fig.text(
-            x_label,
-            y_pred,
-            "Prediction",
-            rotation=90,
-            va="center",
-            ha="center",
-            fontsize=8.6,
-            fontweight="normal",
-        )
+    # =====================================================
+    # SEPARADOR ENTRE CASOS, MUY SUTIL
+    # =====================================================
+    if n_cases > 1:
+        for case_idx in range(1, n_cases):
+            pos = all_axes[case_idx][0, 0].get_position()
+            x_sep = pos.x0 - 0.006
 
-    fig.savefig(save_path, dpi=DPI, bbox_inches="tight", facecolor="white")
+            fig.lines.append(
+                plt.Line2D(
+                    [x_sep, x_sep],
+                    [0.055, 0.855],
+                    transform=fig.transFigure,
+                    color="0.86",
+                    linewidth=0.45,
+                    alpha=0.85,
+                )
+            )
+
+    fig.savefig(save_path, dpi=DPI, bbox_inches="tight", facecolor="white", pad_inches=0.015)
     plt.close(fig)
 
     print(f"\n[OK] Figura guardada en:\n{save_path}")
-
 
 # =========================================================
 # RUN
@@ -784,6 +1068,7 @@ def main():
     print("===============================================")
     print("GT vs Prediction visualization")
     print("2 cases | geometry + GT + prediction | 3 planes")
+    print("Model: ResUNet3D_HQ_3L")
     print("===============================================")
     print("DATA_DIR:", DATA_DIR)
     print("CKPT_PATH:", CKPT_PATH)

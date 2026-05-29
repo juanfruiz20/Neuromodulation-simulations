@@ -23,22 +23,30 @@ from src.modelos.ResUnet3D import ResUNet3D_HQ
 # =========================================================
 DATA_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test"
 
-CKPT_PATH = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_resunet3d_hq_3L_l1_fulldata_100epochs/best.pth"
+# =========================================================
+# MODEL A / MODEL B
+# =========================================================
+CKPT_PATH_A = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/epoch_030.pth"
 
-OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/tablas/GT_vs_PRED_examples"
+CKPT_PATH_B = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_TFG/epoch_220.pth"
+
+MODEL_A_LABEL = "U-Net Full Loss"
+MODEL_B_LABEL = "cGAN Full Loss 220e"
+
+OUT_DIR = r"/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/tablas/ModelA_vs_ModelB_GT_examples"
 
 EXPECTED_SHAPE = (128, 128, 128)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-N_CASES = 2
+N_CASES = 1
 
-# Si quieres forzar casos concretos, pon aqu� los nombres exactos.
+# Si quieres forzar casos concretos, pon los nombres exactos aqu�.
 # Si queda vac�o, selecciona 2 casos no-water diversos autom�ticamente.
 FORCE_FILES = set()
 FORCE_FILES = {
     "sample_0023.npz",
-     "sample_0327.npz",
+    
 }
 
 PLANES = ["sagittal", "coronal", "axial"]
@@ -47,13 +55,13 @@ CMAP_ANATOMY = "gray"
 CMAP_INTENSITY = "jet"
 
 DPI = 320
-SAVE_NAME = "gt_vs_prediction_2_cases_3_planes.png"
+SAVE_NAME = "modelA_modelB_GT_geometry_2_cases_3_planes.png"
 
 SHOW_PEAK_MARKER = False
 
 # =========================================================
 # Model config
-# Ajusta estos par�metros si tu ResUNet3D_HQ se inicializa diferente.
+# Ajusta esto solo si tu clase ResUNet3D_HQ requiere otros argumentos.
 # =========================================================
 MODEL_KWARGS = dict(
     in_ch=2,
@@ -70,7 +78,6 @@ TRANSDUCER_CONTOUR_WIDTH = 1.6
 TRANSDUCER_CONTOUR_ALPHA = 0.95
 TRANSDUCER_THRESHOLD = 0.5
 
-# Full projection helps the transducer contour appear in all three views.
 TRANSDUCER_VIS_MODE = "full_projection"
 
 # =========================================================
@@ -308,9 +315,9 @@ def strip_prefix_if_present(state_dict, prefixes):
     return new_sd
 
 
-def extract_generator_state_dict(ckpt):
+def extract_model_state_dict(ckpt):
     """
-    Intenta extraer el state_dict del generador desde distintos formatos
+    Intenta extraer el state_dict del modelo desde distintos formatos
     comunes de checkpoints.
     """
     if not isinstance(ckpt, dict):
@@ -335,20 +342,18 @@ def extract_generator_state_dict(ckpt):
 
     # Si parece que el checkpoint ya es directamente un state_dict
     if all(isinstance(k, str) for k in ckpt.keys()):
-        tensor_like = [
-            torch.is_tensor(v) for v in ckpt.values()
-        ]
+        tensor_like = [torch.is_tensor(v) for v in ckpt.values()]
         if len(tensor_like) > 0 and any(tensor_like):
             return ckpt
 
     raise RuntimeError(
-        "No se pudo encontrar el state_dict del generador dentro del checkpoint."
+        "No se pudo encontrar el state_dict del modelo dentro del checkpoint."
     )
 
 
-def load_generator_model(ckpt_path: str, device: str):
+def load_model(ckpt_path: str, device: str, label: str):
     print("\n======================================")
-    print("Loading model")
+    print(f"Loading {label}")
     print("======================================")
     print("CKPT_PATH:", ckpt_path)
     print("DEVICE:", device)
@@ -356,7 +361,7 @@ def load_generator_model(ckpt_path: str, device: str):
     model = ResUNet3D_HQ(**MODEL_KWARGS).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    state_dict = extract_generator_state_dict(ckpt)
+    state_dict = extract_model_state_dict(ckpt)
 
     state_dict = strip_prefix_if_present(
         state_dict,
@@ -372,8 +377,8 @@ def load_generator_model(ckpt_path: str, device: str):
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-    print(f"[INFO] Missing keys: {len(missing)}")
-    print(f"[INFO] Unexpected keys: {len(unexpected)}")
+    print(f"[INFO] {label} missing keys: {len(missing)}")
+    print(f"[INFO] {label} unexpected keys: {len(unexpected)}")
 
     if len(missing) > 0:
         print("[WARN] First missing keys:", missing[:5])
@@ -404,7 +409,6 @@ def predict_case(model, case, device):
 
     pred_np = pred[0, 0].detach().cpu().numpy().astype(np.float32)
 
-    # Para visualizaci�n estable
     pred_np = np.nan_to_num(pred_np, nan=0.0, posinf=0.0, neginf=0.0)
     pred_np = np.clip(pred_np, 0.0, None)
 
@@ -527,9 +531,9 @@ def select_diverse_non_water_cases(data_dir: str, n_cases=2):
 
 
 # =========================================================
-# PLOT GT VS PRED
+# PLOT: MODEL A / MODEL B / GT / GEOMETRY
 # =========================================================
-def plot_gt_vs_prediction(cases, save_path):
+def plot_modelA_modelB_gt_geometry(cases, save_path):
     plane_titles = {
         "axial": "Axial",
         "coronal": "Coronal",
@@ -539,15 +543,15 @@ def plot_gt_vs_prediction(cases, save_path):
     n_cases = len(cases)
     n_planes = len(PLANES)
 
-    # 3 filas por caso:
-    # Geometry + Ground truth + Prediction
-    n_rows = n_cases * 3
+    # 4 filas por caso:
+    # Prediction A + Prediction B + Ground truth + Geometry
+    n_rows = n_cases * 4
     n_cols = n_planes
 
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(9.2, 13.6),
+        figsize=(9.2, 17.2),
     )
 
     if n_rows == 1:
@@ -558,26 +562,29 @@ def plot_gt_vs_prediction(cases, save_path):
 
     for case_idx, case in enumerate(cases):
         gt = case["gt"]
-        pred = case["pred"]
+        pred_a = case["pred_a"]
+        pred_b = case["pred_b"]
+
         src = case["source_mask"]
         skull = case["mask_skull"]
         anatomy = case["anatomy"]
         brain = case["brain_mask"]
 
-        # GT and Prediction are shown on the same GT-peak slices.
+        # Las predicciones y el GT se muestran en los mismos cortes,
+        # centrados en el peak del GT.
         z_peak, y_peak, x_peak = get_peak_index(gt, brain)
 
-        # Geometry row is centered on the skull.
+        # La geometr�a se centra en el cr�neo.
         z_skull, y_skull, x_skull = get_skull_center(skull)
 
-        row_geom = case_idx * 3
-        row_gt = case_idx * 3 + 1
-        row_pred = case_idx * 3 + 2
+        row_a = case_idx * 4
+        row_b = case_idx * 4 + 1
+        row_gt = case_idx * 4 + 2
+        row_geom = case_idx * 4 + 3
 
-        # Same scale for GT and prediction within each case.
-        # This makes the comparison visually fair.
+        # Misma escala para A, B y GT dentro de cada caso.
         case_vmin = 0.0
-        case_vmax = float(max(gt.max(), pred.max()))
+        case_vmax = float(max(gt.max(), pred_a.max(), pred_b.max()))
 
         if case_vmax <= 0:
             case_vmax = 1.0
@@ -588,12 +595,73 @@ def plot_gt_vs_prediction(cases, save_path):
         )
 
         for col, plane in enumerate(PLANES):
-            ax_geom = axes[row_geom, col]
+            ax_a = axes[row_a, col]
+            ax_b = axes[row_b, col]
             ax_gt = axes[row_gt, col]
-            ax_pred = axes[row_pred, col]
+            ax_geom = axes[row_geom, col]
 
             # -------------------------------------------------
-            # GEOMETRY
+            # Prediction Model A
+            # -------------------------------------------------
+            pred_a_slice = extract_plane(
+                pred_a,
+                z_peak,
+                y_peak,
+                x_peak,
+                plane,
+            )
+
+            ax_a.imshow(
+                pred_a_slice,
+                cmap=CMAP_INTENSITY,
+                vmin=case_vmin,
+                vmax=case_vmax,
+                origin="lower",
+                interpolation="nearest",
+            )
+
+            # -------------------------------------------------
+            # Prediction Model B
+            # -------------------------------------------------
+            pred_b_slice = extract_plane(
+                pred_b,
+                z_peak,
+                y_peak,
+                x_peak,
+                plane,
+            )
+
+            ax_b.imshow(
+                pred_b_slice,
+                cmap=CMAP_INTENSITY,
+                vmin=case_vmin,
+                vmax=case_vmax,
+                origin="lower",
+                interpolation="nearest",
+            )
+
+            # -------------------------------------------------
+            # Ground truth
+            # -------------------------------------------------
+            gt_slice = extract_plane(
+                gt,
+                z_peak,
+                y_peak,
+                x_peak,
+                plane,
+            )
+
+            ax_gt.imshow(
+                gt_slice,
+                cmap=CMAP_INTENSITY,
+                vmin=case_vmin,
+                vmax=case_vmax,
+                origin="lower",
+                interpolation="nearest",
+            )
+
+            # -------------------------------------------------
+            # Geometry
             # -------------------------------------------------
             anatomy_slice = extract_plane(
                 anatomy,
@@ -625,49 +693,10 @@ def plot_gt_vs_prediction(cases, save_path):
 
             draw_transducer_contour(ax_geom, src_vis_slice)
 
-            # -------------------------------------------------
-            # GROUND TRUTH
-            # -------------------------------------------------
-            gt_slice = extract_plane(
-                gt,
-                z_peak,
-                y_peak,
-                x_peak,
-                plane,
-            )
-
-            ax_gt.imshow(
-                gt_slice,
-                cmap=CMAP_INTENSITY,
-                vmin=case_vmin,
-                vmax=case_vmax,
-                origin="lower",
-                interpolation="nearest",
-            )
-
-            # -------------------------------------------------
-            # PREDICTION
-            # -------------------------------------------------
-            pred_slice = extract_plane(
-                pred,
-                z_peak,
-                y_peak,
-                x_peak,
-                plane,
-            )
-
-            ax_pred.imshow(
-                pred_slice,
-                cmap=CMAP_INTENSITY,
-                vmin=case_vmin,
-                vmax=case_vmax,
-                origin="lower",
-                interpolation="nearest",
-            )
-
             if SHOW_PEAK_MARKER:
                 px, py = peak_marker_coords(z_peak, y_peak, x_peak, plane)
-                for ax in [ax_gt, ax_pred]:
+
+                for ax in [ax_a, ax_b, ax_gt]:
                     ax.plot(
                         px,
                         py,
@@ -678,14 +707,14 @@ def plot_gt_vs_prediction(cases, save_path):
                     )
 
             if case_idx == 0:
-                ax_geom.set_title(
+                ax_a.set_title(
                     plane_titles[plane],
                     fontsize=15,
                     fontweight="semibold",
                     pad=3,
                 )
 
-            for ax in [ax_geom, ax_gt, ax_pred]:
+            for ax in [ax_a, ax_b, ax_gt, ax_geom]:
                 ax.set_xticks([])
                 ax.set_yticks([])
 
@@ -693,12 +722,12 @@ def plot_gt_vs_prediction(cases, save_path):
                     spine.set_color("white")
                     spine.set_linewidth(0.7)
 
-    # Compact layout
+    # Layout compacto
     plt.subplots_adjust(
-        left=0.125,
+        left=0.135,
         right=0.998,
-        top=0.974,
-        bottom=0.022,
+        top=0.978,
+        bottom=0.018,
         wspace=0.008,
         hspace=0.008,
     )
@@ -709,23 +738,25 @@ def plot_gt_vs_prediction(cases, save_path):
     fig.canvas.draw()
 
     for case_idx in range(n_cases):
-        row_geom = case_idx * 3
-        row_gt = case_idx * 3 + 1
-        row_pred = case_idx * 3 + 2
+        row_a = case_idx * 4
+        row_b = case_idx * 4 + 1
+        row_gt = case_idx * 4 + 2
+        row_geom = case_idx * 4 + 3
 
-        pos_geom = axes[row_geom, 0].get_position()
+        pos_a = axes[row_a, 0].get_position()
+        pos_b = axes[row_b, 0].get_position()
         pos_gt = axes[row_gt, 0].get_position()
-        pos_pred = axes[row_pred, 0].get_position()
+        pos_geom = axes[row_geom, 0].get_position()
 
-        # Center of the full case block
-        y_case = 0.5 * (pos_geom.y1 + pos_pred.y0)
+        y_case = 0.5 * (pos_a.y1 + pos_geom.y0)
 
-        y_geometry = 0.5 * (pos_geom.y0 + pos_geom.y1)
+        y_a = 0.5 * (pos_a.y0 + pos_a.y1)
+        y_b = 0.5 * (pos_b.y0 + pos_b.y1)
         y_gt = 0.5 * (pos_gt.y0 + pos_gt.y1)
-        y_pred = 0.5 * (pos_pred.y0 + pos_pred.y1)
+        y_geom = 0.5 * (pos_geom.y0 + pos_geom.y1)
 
-        x_case = pos_geom.x0 - 0.044
-        x_label = pos_geom.x0 - 0.020
+        x_case = pos_a.x0 - 0.052
+        x_label = pos_a.x0 - 0.024
 
         fig.text(
             x_case,
@@ -740,12 +771,23 @@ def plot_gt_vs_prediction(cases, save_path):
 
         fig.text(
             x_label,
-            y_geometry,
-            "Geometry",
+            y_a,
+            MODEL_A_LABEL,
             rotation=90,
             va="center",
             ha="center",
-            fontsize=8.6,
+            fontsize=8.3,
+            fontweight="normal",
+        )
+
+        fig.text(
+            x_label,
+            y_b,
+            MODEL_B_LABEL,
+            rotation=90,
+            va="center",
+            ha="center",
+            fontsize=8.3,
             fontweight="normal",
         )
 
@@ -756,18 +798,18 @@ def plot_gt_vs_prediction(cases, save_path):
             rotation=90,
             va="center",
             ha="center",
-            fontsize=8.6,
+            fontsize=8.3,
             fontweight="normal",
         )
 
         fig.text(
             x_label,
-            y_pred,
-            "Prediction",
+            y_geom,
+            "Geometry",
             rotation=90,
             va="center",
             ha="center",
-            fontsize=8.6,
+            fontsize=8.3,
             fontweight="normal",
         )
 
@@ -782,15 +824,17 @@ def plot_gt_vs_prediction(cases, save_path):
 # =========================================================
 def main():
     print("===============================================")
-    print("GT vs Prediction visualization")
-    print("2 cases | geometry + GT + prediction | 3 planes")
+    print("Model A vs Model B vs Ground truth visualization")
+    print("2 cases | A + B + GT + Geometry | 3 planes")
     print("===============================================")
     print("DATA_DIR:", DATA_DIR)
-    print("CKPT_PATH:", CKPT_PATH)
+    print("CKPT_PATH_A:", CKPT_PATH_A)
+    print("CKPT_PATH_B:", CKPT_PATH_B)
     print("OUT_DIR:", OUT_DIR)
     print("DEVICE:", DEVICE)
 
-    model = load_generator_model(CKPT_PATH, DEVICE)
+    model_a = load_model(CKPT_PATH_A, DEVICE, MODEL_A_LABEL)
+    model_b = load_model(CKPT_PATH_B, DEVICE, MODEL_B_LABEL)
 
     all_files = sorted(glob.glob(os.path.join(DATA_DIR, "*.npz")))
 
@@ -826,19 +870,24 @@ def main():
         print(" -", c["file_name"])
 
     print("\nRunning model predictions...")
+
     for case in selected_cases:
-        pred = predict_case(model, case, DEVICE)
-        case["pred"] = pred
+        pred_a = predict_case(model_a, case, DEVICE)
+        pred_b = predict_case(model_b, case, DEVICE)
+
+        case["pred_a"] = pred_a
+        case["pred_b"] = pred_b
 
         print(
             f"[INFO] {case['file_name']} | "
             f"GT max={case['gt'].max():.4f} | "
-            f"Pred max={pred.max():.4f}"
+            f"A max={pred_a.max():.4f} | "
+            f"B max={pred_b.max():.4f}"
         )
 
     save_path = os.path.join(OUT_DIR, SAVE_NAME)
 
-    plot_gt_vs_prediction(
+    plot_modelA_modelB_gt_geometry(
         cases=selected_cases,
         save_path=save_path,
     )
