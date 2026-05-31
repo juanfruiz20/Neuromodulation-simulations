@@ -1,21 +1,17 @@
+from src.models.resunet_3d import ResUNet3D_HQ
+import torch
+from scipy.ndimage import (
+    binary_fill_holes,
+    binary_dilation,
+    center_of_mass,
+)
+import matplotlib.pyplot as plt
 import os
 import glob
 import numpy as np
 import matplotlib
 
 matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-
-from scipy.ndimage import (
-    binary_fill_holes,
-    binary_dilation,
-    center_of_mass,
-)
-
-import torch
-
-from src.modelos.ResUnet3D import ResUNet3D_HQ
 
 
 # =========================================================
@@ -62,10 +58,10 @@ FORCE_FILES = set()
 
 # Ejemplo:
 FORCE_FILES = {
-     "sample_0174.npz",
-     "sample_0151.npz",
-     "sample_0639.npz",
-     "sample_0040.npz",
+    "sample_0174.npz",
+    "sample_0151.npz",
+    "sample_0639.npz",
+    "sample_0040.npz",
 }
 
 # =========================================================
@@ -755,7 +751,8 @@ def plot_modelA_modelB_gt_geometry_4x4(cases, save_path):
         # Row 3: Geometry
         # -------------------------------------------------
         ax = axes[3, col]
-        anatomy_slice = extract_plane(anatomy, z_skull, y_skull, x_skull, plane)
+        anatomy_slice = extract_plane(
+            anatomy, z_skull, y_skull, x_skull, plane)
         anatomy_slice = normalize_for_display(anatomy_slice)
 
         ax.imshow(

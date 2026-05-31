@@ -1,17 +1,13 @@
+from src.models.resunet_3d import ResUNet3D_HQ
+import torch
+from scipy.ndimage import binary_fill_holes, binary_dilation
+import matplotlib.pyplot as plt
 import os
 import glob
 import numpy as np
 import matplotlib
 
 matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-
-from scipy.ndimage import binary_fill_holes, binary_dilation
-
-import torch
-
-from src.modelos.ResUnet3D import ResUNet3D_HQ
 
 
 # =========================================================
@@ -183,7 +179,8 @@ def load_case(path, expected_shape=(128, 128, 128)):
         skull = d["mask_skull"].astype(np.float32)
 
         if "p_max_norm" not in d:
-            raise RuntimeError(f"{os.path.basename(path)} does not contain p_max_norm")
+            raise RuntimeError(
+                f"{os.path.basename(path)} does not contain p_max_norm")
 
         gt = d["p_max_norm"].astype(np.float32)
         anatomy, anatomy_key = choose_anatomy_volume(d, skull)
@@ -518,7 +515,8 @@ def plot_failure_cases_2cases_3planes(cases, save_path):
             Rows: Prediction, Ground truth, Geometry
     """
     if len(cases) != 2:
-        raise RuntimeError(f"This function expects exactly 2 cases. Received: {len(cases)}")
+        raise RuntimeError(
+            f"This function expects exactly 2 cases. Received: {len(cases)}")
 
     n_rows = 6
     n_cols = len(PLANES)
@@ -562,7 +560,8 @@ def plot_failure_cases_2cases_3planes(cases, save_path):
         elif GEOMETRY_SLICE_MODE == "skull":
             z_geom, y_geom, x_geom = get_skull_center(skull)
         else:
-            raise ValueError(f"Unknown GEOMETRY_SLICE_MODE: {GEOMETRY_SLICE_MODE}")
+            raise ValueError(
+                f"Unknown GEOMETRY_SLICE_MODE: {GEOMETRY_SLICE_MODE}")
 
         field_vmin = 0.0
         field_vmax = float(max(gt.max(), pred.max()))
@@ -627,7 +626,8 @@ def plot_failure_cases_2cases_3planes(cases, save_path):
             # ----------------------------
             ax = axes[row_offset + 2, col]
 
-            anatomy_slice = extract_plane(anatomy, z_geom, y_geom, x_geom, plane)
+            anatomy_slice = extract_plane(
+                anatomy, z_geom, y_geom, x_geom, plane)
             anatomy_slice = normalize_for_display(anatomy_slice)
 
             ax.imshow(
@@ -640,7 +640,8 @@ def plot_failure_cases_2cases_3planes(cases, save_path):
             if TRANSDUCER_VIS_MODE == "full_projection":
                 src_vis_slice = project_volume_to_plane(src_vis_3d, plane)
             else:
-                src_vis_slice = extract_plane(src_vis_3d, z_geom, y_geom, x_geom, plane)
+                src_vis_slice = extract_plane(
+                    src_vis_3d, z_geom, y_geom, x_geom, plane)
 
             draw_transducer_contour(ax, src_vis_slice)
 
@@ -753,7 +754,8 @@ def main():
         gt_peak = get_peak_index(case["gt"], case["brain_mask"])
         pred_peak = get_peak_index(pred, case["brain_mask"])
 
-        peak_dist_vox = float(np.linalg.norm(np.array(gt_peak) - np.array(pred_peak)))
+        peak_dist_vox = float(np.linalg.norm(
+            np.array(gt_peak) - np.array(pred_peak)))
         peak_dist_mm = peak_dist_vox * float(case["dx_mm"])
 
         print(

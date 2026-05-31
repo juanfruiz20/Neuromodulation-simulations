@@ -8,22 +8,22 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
-from src.helpers.dataloader import TusDataset
-from src.helpers.reproducibility import seed_all
-from src.helpers.loaders import make_loader
+from src.data.dataloader import TusDataset
+from src.utils.reproducibility import seed_all
+from src.data.loaders import make_loader
 
 
 from src.losses.tube_aware_loss import StableTubeAwareTUSLoss
 
-from src.modelos.ResUnet3D import ResUNet3D_HQ
-from src.modelos.Discriminator3D import PatchDiscriminator3D
+from src.models.resunet_3d import ResUNet3D_HQ
+from src.models.discriminator_3d import PatchDiscriminator3D
 
 from src.metrics.validation_metrics import eval_extra_metrics
 
 from src.visualization.visual_callback import VisualCallback
 
 from src.training.schedules import adv_weight_schedule
-from src.training.checkpoints import save_ckpt
+from src.training.ckpt import save_ckpt
 from src.training.logging_utils import (
     init_csv,
     append_csv,
@@ -36,6 +36,7 @@ try:
     from torch.amp.grad_scaler import GradScaler
 except Exception:
     from torch.cuda.amp import GradScaler
+
 
 def main():
     # =========================

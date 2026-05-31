@@ -21,7 +21,7 @@ from kwave.options.simulation_execution_options import SimulationExecutionOption
 # IMPORTA TU MODELO
 # =========================================================
 # Ajusta este import si tu archivo o clase tiene otro nombre.
-from src.modelos.ResUnet3D import ResUNet3D_HQ
+from src.models.resunet_3d import ResUNet3D_HQ
 
 
 # =========================================================

@@ -1,21 +1,17 @@
+from src.models.resunet_3d import ResUNet3D_HQ
+import torch
+from scipy.ndimage import (
+    binary_fill_holes,
+    binary_dilation,
+    center_of_mass,
+)
+import matplotlib.pyplot as plt
 import os
 import glob
 import numpy as np
 import matplotlib
 
 matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-
-from scipy.ndimage import (
-    binary_fill_holes,
-    binary_dilation,
-    center_of_mass,
-)
-
-import torch
-
-from src.modelos.ResUnet3D import ResUNet3D_HQ
 
 
 # =========================================================
@@ -38,7 +34,7 @@ N_CASES = 2
 FORCE_FILES = set()
 FORCE_FILES = {
     "sample_0023.npz",
-     "sample_0327.npz",
+    "sample_0327.npz",
 }
 
 PLANES = ["sagittal", "coronal", "axial"]
