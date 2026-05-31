@@ -28,16 +28,19 @@ from src.modelos.ResUnet3D import ResUNet3D_HQ
 # CONFIG
 # =========================================================
 
-TEST_DIR = Path("/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/dataset_TUS_SplitV1/test")
+TEST_DIR = Path(
+    "C:\\Users\\USUARIO\\Desktop\\UIC Bioingenieria\\TFG\\Neuromodulation-simulations\\timetestnpz")
 
-MODEL1_CKPT = Path("/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_unet_expDexpB/epoch_030.pth")
-MODEL2_CKPT = Path("/data/home/agustin/Documents/oslo/TFG Juanfe/Neuromodulation-simulations/checkpoints_cgan_TFG/epoch_220.pth")
+MODEL1_CKPT = Path(
+    "C:\\Users\\USUARIO\\Desktop\\UIC Bioingenieria\\TFG\\Neuromodulation-simulations\\epoch_030.pth")
+MODEL2_CKPT = Path(
+    "C:\\Users\\USUARIO\\Desktop\\UIC Bioingenieria\\TFG\\Neuromodulation-simulations\\epoch_220.pth")
 
 MODEL1_NAME = "U-Net Full Loss"
 MODEL2_NAME = "cGAN Full Loss 220e"
 
-OUT_CSV = Path("timing_kwave_model1_model2.csv")
-OUT_SUMMARY_CSV = Path("timing_summary.csv")
+OUT_CSV = Path("timing_kwave_model1_model2_ASUS.csv")
+OUT_SUMMARY_CSV = Path("timing_summary_ASUS.csv")
 
 N_CASES = 10
 RANDOM_SEED = 42
@@ -75,7 +78,8 @@ def select_test_cases(test_dir, n_cases=10, seed=42):
     files = sorted(test_dir.glob("*.npz"))
 
     if len(files) == 0:
-        raise FileNotFoundError(f"No se encontraron archivos .npz en: {test_dir}")
+        raise FileNotFoundError(
+            f"No se encontraron archivos .npz en: {test_dir}")
 
     random.seed(seed)
 
