@@ -1,21 +1,18 @@
+import torch.nn.functional as F
+import torch.nn as nn
+import torch
+from scipy.ndimage import (
+    binary_fill_holes,
+    binary_dilation,
+    center_of_mass,
+)
+import matplotlib.pyplot as plt
 import os
 import glob
 import numpy as np
 import matplotlib
 
 matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-
-from scipy.ndimage import (
-    binary_fill_holes,
-    binary_dilation,
-    center_of_mass,
-)
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
 # =========================================================
@@ -34,7 +31,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N_CASES = 2
 
 # Si quieres forzar casos concretos, pon aqu� los nombres exactos.
-# Si queda vac�o, selecciona 2 casos no-water diversos autom�ticamente.
+
 FORCE_FILES = [
     "sample_0981.npz",
     "sample_0327.npz",
@@ -1056,7 +1053,8 @@ def plot_gt_vs_prediction(cases, save_path):
                 )
             )
 
-    fig.savefig(save_path, dpi=DPI, bbox_inches="tight", facecolor="white", pad_inches=0.015)
+    fig.savefig(save_path, dpi=DPI, bbox_inches="tight",
+                facecolor="white", pad_inches=0.015)
     plt.close(fig)
 
     print(f"\n[OK] Figura guardada en:\n{save_path}")
@@ -1064,6 +1062,8 @@ def plot_gt_vs_prediction(cases, save_path):
 # =========================================================
 # RUN
 # =========================================================
+
+
 def main():
     print("===============================================")
     print("GT vs Prediction visualization")
